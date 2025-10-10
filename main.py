@@ -10,6 +10,7 @@ import requests
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+import base64  # New: For decoding base64 image data
 
 # LLM Provider imports with availability checking
 try:
@@ -17,6 +18,7 @@ try:
     GEMINI_AVAILABLE = True
 except ImportError:
     GEMINI_AVAILABLE = False
+    genai = None
     logging.warning("Google Generative AI not available. Install with: pip install google-generativeai")
 
 try:
@@ -118,19 +120,32 @@ class Server:
 
     async def initialize(self) -> None:
         """Initialize the server connection."""
+        logging.info(f"[{self.name}] Initializing server with command: {self.config['command']}")
+        logging.info(f"[{self.name}] Server args: {self.config['args']}")
+        logging.info(f"[{self.name}] Server env: {self.config.get('env', {})}")
+        
+        command = shutil.which("npx") if self.config['command'] == "npx" else self.config['command']
+        if not command:
+            raise ValueError(f"Command not found: {self.config['command']}")
+        
         server_params = StdioServerParameters(
-            command=shutil.which("npx") if self.config['command'] == "npx" else self.config['command'],
+            command=command,
             args=self.config['args'],
             env={**os.environ, **self.config['env']} if self.config.get('env') else None
         )
         try:
+            logging.info(f"[{self.name}] Creating stdio client...")
             self.stdio_context = stdio_client(server_params)
             read, write = await self.stdio_context.__aenter__()
+            logging.info(f"[{self.name}] Creating client session...")
             self.session = ClientSession(read, write)
             await self.session.__aenter__()
-            self.capabilities = await self.session.initialize()
+            logging.info(f"[{self.name}] Initializing session...")
+            init_result = await self.session.initialize()
+            self.capabilities = dict(init_result.capabilities) if hasattr(init_result, 'capabilities') else {}
+            logging.info(f"[{self.name}] Server initialized successfully with capabilities: {self.capabilities}")
         except Exception as e:
-            logging.error(f"Error initializing server {self.name}: {e}")
+            logging.error(f"[{self.name}] Error initializing server: {e}")
             await self.cleanup()
             raise
 
@@ -191,6 +206,27 @@ class Server:
         if not self.session:
             raise RuntimeError(f"Server {self.name} not initialized")
 
+        # Enhanced: For screenshot tools, ensure proper path handling and parameter types
+        screenshot_tools = ['browser_screenshot', 'browser_take_screenshot', 'puppeteer_screenshot', 'puppeteer_take_screenshot']
+        if tool_name in screenshot_tools:
+            # Fix parameter types for screenshot tools
+            if 'fullPage' in arguments and isinstance(arguments['fullPage'], str):
+                arguments['fullPage'] = arguments['fullPage'].lower() == 'true'
+                logging.info(f"[{self.name}] Converted fullPage string to boolean: {arguments['fullPage']}")
+            
+            if 'path' not in arguments:
+                # Ensure images directory exists
+                os.makedirs('images', exist_ok=True)
+                timestamp = int(asyncio.get_event_loop().time())
+                arguments['path'] = f"images/screenshot_{tool_name}_{timestamp}.png"
+                logging.info(f"[{self.name}] Added default image path for {tool_name}: {arguments['path']}")
+            elif not arguments['path'].startswith('images/'):
+                # If path doesn't start with images/, prepend it
+                arguments['path'] = f"images/{arguments['path']}"
+                logging.info(f"[{self.name}] Modified path to save in images folder: {arguments['path']}")
+
+        logging.info(f"[{self.name}] Attempting to execute tool '{tool_name}' with arguments: {arguments}")
+        
         attempt = 0
         while attempt < retries:
             try:
@@ -199,27 +235,42 @@ class Server:
                     and 'progress' in self.capabilities
                 )
 
+                logging.info(f"[{self.name}] Progress tracking supported: {supports_progress}")
+                logging.info(f"[{self.name}] Server capabilities: {self.capabilities}")
+
                 if supports_progress:
-                    logging.info(f"Executing {tool_name} with progress tracking...")
+                    logging.info(f"[{self.name}] Executing {tool_name} with progress tracking...")
                     result = await self.session.call_tool(
                         tool_name, 
-                        arguments,
-                        progress_token=f"{tool_name}_execution"
+                        arguments
                     )
                 else:
-                    logging.info(f"Executing {tool_name}...")
+                    logging.info(f"[{self.name}] Executing {tool_name}...")
                     result = await self.session.call_tool(tool_name, arguments)
+
+                logging.info(f"[{self.name}] Tool '{tool_name}' executed successfully with result: {result}")
+
+                # New: Save screenshot if it's a screenshot tool and result contains image data
+                if tool_name in screenshot_tools and result and hasattr(result, 'content'):
+                    for content in result.content:
+                        if hasattr(content, 'mimeType') and content.mimeType == 'image/png' and hasattr(content, 'data'):
+                            # Decode base64 image data and save to file
+                            image_data = base64.b64decode(content.data)
+                            with open(arguments['path'], 'wb') as f:
+                                f.write(image_data)
+                            logging.info(f"[{self.name}] Screenshot saved to: {arguments['path']}")
+                            break
 
                 return result
 
             except Exception as e:
                 attempt += 1
-                logging.warning(f"Error executing tool: {e}. Attempt {attempt} of {retries}.")
+                logging.warning(f"[{self.name}] Error executing tool '{tool_name}': {e}. Attempt {attempt} of {retries}.")
                 if attempt < retries:
-                    logging.info(f"Retrying in {delay} seconds...")
+                    logging.info(f"[{self.name}] Retrying in {delay} seconds...")
                     await asyncio.sleep(delay)
                 else:
-                    logging.error("Max retries reached. Failing.")
+                    logging.error(f"[{self.name}] Max retries reached for tool '{tool_name}'. Failing.")
                     raise
 
     async def cleanup(self) -> None:
@@ -267,6 +318,9 @@ class Tool:
                 arg_desc = f"- {param_name}: {param_info.get('description', 'No description')}"
                 if param_name in self.input_schema.get('required', []):
                     arg_desc += " (required)"
+                # Enhanced: Note for path in screenshot tools
+                if param_name == 'path' and self.name in ['browser_screenshot', 'browser_take_screenshot', 'puppeteer_screenshot', 'puppeteer_take_screenshot']:
+                    arg_desc += " (use 'images/filename.png' to save in images folder)"
                 args_desc.append(arg_desc)
         
         return f"""
@@ -287,8 +341,12 @@ class MultiLLMClient:
         self.fallback_mode: bool = False  # User controls fallback mode
         
         # Initialize Gemini if available
-        if GEMINI_AVAILABLE and self.config.gemini_api_key:
-            genai.configure(api_key=self.config.gemini_api_key)
+        if GEMINI_AVAILABLE and self.config.gemini_api_key and genai:
+            try:
+                # Configure Gemini API
+                genai.configure(api_key=self.config.gemini_api_key)  # type: ignore
+            except Exception as e:
+                logging.warning(f"Failed to configure Gemini: {e}")
         
         # Initialize Groq if available
         if GROQ_AVAILABLE and self.config.groq_api_key:
@@ -383,9 +441,14 @@ class MultiLLMClient:
             elif message["role"] == "assistant":
                 prompt += f"Assistant: {message['content']}\n\n"
         
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        response = model.generate_content(prompt)
-        return response.text
+        try:
+            if not genai:
+                raise Exception("Gemini module not available")
+            model = genai.GenerativeModel('gemini-2.0-flash')  # type: ignore
+            response = model.generate_content(prompt)
+            return response.text if response.text else "No response generated"
+        except Exception as e:
+            raise Exception(f"Gemini API error: {e}")
 
     def _get_groq_response(self, messages: List[Dict[str, str]]) -> str:
         """Get response from Groq API."""
@@ -402,20 +465,31 @@ class MultiLLMClient:
             
             for model in models:
                 try:
+                    # Convert messages to proper format for Groq
+                    groq_messages = []
+                    for msg in messages:
+                        groq_messages.append({
+                            "role": msg["role"],
+                            "content": msg["content"]
+                        })
+                    
                     response = self.groq_client.chat.completions.create(
-                        messages=messages,
+                        messages=groq_messages,
                         model=model,
                         temperature=0.7,
                         max_tokens=4096,
                         top_p=1,
                         stream=False
                     )
-                    return response.choices[0].message.content
+                    return response.choices[0].message.content or "No response generated"
                 except Exception as model_error:
                     if model == models[-1]:  # Last model
                         raise model_error
                     logging.warning(f"Model {model} failed: {model_error}. Trying next...")
                     continue
+            
+            # This should never be reached, but just in case
+            return "No response generated"
         except Exception as e:
             raise Exception(f"All Groq models failed: {e}")
 
@@ -425,7 +499,7 @@ class MultiLLMClient:
             raise Exception("Ollama not available")
         
         response = ollama.chat(model=model, messages=messages)
-        return response['message']['content']
+        return response['message']['content'] if response and 'message' in response else "No response generated"
 
     def get_weather_data(self, lat: float, lon: float, exclude: str = "minutely,hourly") -> Dict[str, Any]:
         """Get weather data from Open-Meteo API (Free).
@@ -513,33 +587,96 @@ class ChatSession:
             The result of tool execution or the original response.
         """
         import json
+        import re
+
+        # Split response into individual JSON objects
+        tool_calls = []
         try:
-            tool_call = json.loads(llm_response)
-            if "tool" in tool_call and "arguments" in tool_call:
-                logging.info(f"Executing tool: {tool_call['tool']}")
-                logging.info(f"With arguments: {tool_call['arguments']}")
-                
-                for server in self.servers:
+            # Extract JSON objects from the response (handles multiple JSON blocks)
+            json_strings = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', llm_response.replace('\n', ''))
+            for json_str in json_strings:
+                try:
+                    tool_call = json.loads(json_str)
+                    if "tool" in tool_call and "arguments" in tool_call:
+                        tool_calls.append(tool_call)
+                except json.JSONDecodeError as e:
+                    logging.warning(f"Failed to parse JSON block: {json_str}, error: {e}")
+                    continue
+        except Exception as e:
+            logging.error(f"Error parsing LLM response: {e}")
+            return llm_response
+
+        # If no tool calls found, try single JSON parsing for backward compatibility
+        if not tool_calls:
+            try:
+                tool_call = json.loads(llm_response)
+                if "tool" in tool_call and "arguments" in tool_call:
+                    tool_calls.append(tool_call)
+            except json.JSONDecodeError:
+                return llm_response
+
+        # Execute tool calls sequentially
+        results = []
+        for i, tool_call in enumerate(tool_calls):
+            tool_name = tool_call["tool"]
+            arguments = tool_call["arguments"]
+            logging.info(f"Executing tool {i+1}/{len(tool_calls)}: {tool_name}")
+            logging.info(f"With arguments: {arguments}")
+            
+            tool_executed = False
+            for server in self.servers:
+                try:
                     tools = await server.list_tools()
-                    if any(tool.name == tool_call["tool"] for tool in tools):
+                    if any(tool.name == tool_name for tool in tools):
                         try:
-                            result = await server.execute_tool(tool_call["tool"], tool_call["arguments"])
+                            result = await server.execute_tool(tool_name, arguments)
                             
                             if isinstance(result, dict) and 'progress' in result:
                                 progress = result['progress']
                                 total = result['total']
                                 logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
-                                
-                            return f"Tool execution result: {result}"
+                            
+                            results.append(f"Tool {tool_name} executed successfully: {result}")
+                            tool_executed = True
+                            break
                         except Exception as e:
-                            error_msg = f"Error executing tool: {str(e)}"
+                            error_msg = f"Error executing tool {tool_name}: {str(e)}"
                             logging.error(error_msg)
-                            return error_msg
-                
-                return f"No server found with tool: {tool_call['tool']}"
-            return llm_response
-        except json.JSONDecodeError:
-            return llm_response
+                            results.append(error_msg)
+                            tool_executed = True
+                            break
+                except Exception as e:
+                    logging.warning(f"Error listing tools from server {server.name}: {e}")
+                    continue
+            
+            if not tool_executed:
+                results.append(f"No server found with tool: {tool_name}")
+
+        if results:
+            # Combine results and send back to LLM for final response
+            combined_result = "\n".join(results)
+            logging.info(f"All tool executions completed. Results: {combined_result}")
+            
+            # Create a summary message for the LLM
+            summary_messages = [
+                {
+                    "role": "system", 
+                    "content": f"Tool execution results: {combined_result}\n\nPlease provide a conversational summary of what was accomplished. If the tools executed successfully, confirm the actions were completed. If there were errors, explain what went wrong."
+                },
+                {
+                    "role": "user", 
+                    "content": "Please summarize the tool execution results in a conversational manner."
+                }
+            ]
+            
+            try:
+                final_response = self.llm_client.get_response(summary_messages)
+                return final_response
+            except Exception as e:
+                logging.error(f"Error getting final response from LLM: {e}")
+                return f"Tools executed. Results: {combined_result}"
+        
+        return llm_response
 
     def show_help(self) -> None:
         """Show available commands and options."""
@@ -690,6 +827,17 @@ class ChatSession:
             self.tools_loaded = len(self.all_tools) > 0
             print(f"\n📦 Total tools available: {len(self.all_tools)}")
             
+            # Debug: Show available tools from each server
+            print(f"\n🔍 Available tools from each server:")
+            for server in self.servers:
+                if server.session:
+                    try:
+                        tools = await server.list_tools()
+                        tool_names = [tool.name for tool in tools]
+                        print(f"  📦 {server.name}: {tool_names}")
+                    except Exception as e:
+                        print(f"  ❌ {server.name}: Error listing tools - {e}")
+            
             # LLM Provider Selection
             print("\n🤖 SELECT YOUR LLM PROVIDER:")
             print("="*70)
@@ -720,7 +868,8 @@ class ChatSession:
                         selected_provider = available_providers[choice_idx]
                         if self.llm_client.switch_provider(selected_provider):
                             print(f"\n✅ Selected: {selected_provider}")
-                            print(f"🎯 Current provider: {self.llm_client.current_provider.value}")
+                            current_provider = self.llm_client.current_provider
+                            print(f"🎯 Current provider: {current_provider.value if current_provider else 'None'}")
                             break
                         else:
                             print("❌ Failed to switch provider. Please try again.")
@@ -735,7 +884,7 @@ class ChatSession:
             print("\n💡 Type /help for commands or start chatting!")
             print("="*70)
             
-            # Build system message
+            # Build system message (FIXED: Allow multiple tool calls)
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
             
             system_message = f"""You are a helpful assistant with access to these tools: 
@@ -743,13 +892,16 @@ class ChatSession:
 {tools_description}
 Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.
 
-IMPORTANT: When you need to use a tool, you must ONLY respond with the exact JSON object format below, nothing else:
+IMPORTANT: When you need to use a tool, respond with the exact JSON object format below. For multiple tools or multi-step tasks, provide multiple JSON objects, each on a separate line. Nothing else in the response:
+
 {{
     "tool": "tool-name",
     "arguments": {{
         "argument-name": "value"
     }}
 }}
+
+For screenshot tools (browser_take_screenshot, puppeteer_screenshot, etc.), always use a path starting with 'images/' (e.g., 'images/screenshot.png') to save in the images folder. Use boolean values for fullPage parameter (true/false, not "true"/"false").
 
 After receiving a tool's response:
 1. Transform the raw data into a natural, conversational response
@@ -876,6 +1028,10 @@ Please use only the tools that are explicitly defined above."""
 
 async def main() -> None:
     """Initialize and run the chat session."""
+    # New: Create images folder for snapshots
+    os.makedirs('images', exist_ok=True)
+    logging.info("Created 'images' folder for snapshot storage.")
+
     config = Configuration()
     server_config = config.load_config('servers_config.json')
     servers = [Server(name, srv_config) for name, srv_config in server_config['mcpServers'].items()]
