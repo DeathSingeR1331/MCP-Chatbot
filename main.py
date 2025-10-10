@@ -344,6 +344,16 @@ class MultiLLMClient:
         
         # Ollama removed - only using Groq and Gemini
 
+        # Auto-select a sensible default provider if available so users don't need /switch
+        try:
+            if LLMProvider.GROQ in self.available_providers:
+                self.current_provider = LLMProvider.GROQ
+            elif LLMProvider.GEMINI in self.available_providers:
+                self.current_provider = LLMProvider.GEMINI
+        except Exception:
+            # Non-fatal: leave provider unset; get_response will handle gracefully
+            pass
+
     def get_response(self, messages: List[Dict[str, str]], provider: Optional[LLMProvider] = None) -> str:
         """Get a response from the selected LLM provider.
         
@@ -354,11 +364,17 @@ class MultiLLMClient:
         Returns:
             The LLM's response as a string.
         """
-        # Use the specified provider or current provider
+        # Use the specified provider or current provider; if none, auto-select first available
         target_provider = provider or self.current_provider
-        
         if not target_provider:
-            return "⚠️ No LLM provider selected. Please use /switch <provider> to select one."
+            if self.available_providers:
+                self.current_provider = self.available_providers[0]
+                target_provider = self.current_provider
+                logging.info(f"🎯 Auto-selected LLM provider: {target_provider.value}")
+            else:
+                return (
+                    "❌ No LLM providers available. Set GROQ_API_KEY or GEMINI_API_KEY in your environment/.env."
+                )
         
         # Try the selected provider
         try:
@@ -839,7 +855,7 @@ Please use only the tools that are explicitly defined above with their EXACT nam
         elif cmd in ['/weather'] and len(parts) >= 3:
             try:
                 lat, lon = float(parts[1]), float(parts[2])
-                print(f"🌤️  Fetching weather data for ({lat}, {lon})...")
+                print(f"🌤  Fetching weather data for ({lat}, {lon})...")
                 weather_data = self.llm_client.get_weather_data(lat, lon)
                 if "error" in weather_data:
                     print(f"❌ {weather_data['error']}\n")
@@ -855,7 +871,7 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                 for tool in self.all_tools:
                     print(f"  📦 {tool.name}: {tool.description}")
             else:
-                print("  ⚠️  Tools not yet loaded. They will be loaded when MCP servers initialize.")
+                print("  ⚠  Tools not yet loaded. They will be loaded when MCP servers initialize.")
             print()
         
         elif cmd in ['/status', '/s']:
@@ -902,7 +918,7 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                     logging.error(f"  ✗ Failed to initialize server '{server.name}': {e}")
             
             if initialized_servers == 0:
-                print("\n⚠️  No MCP servers were initialized. Continuing without tools...")
+                print("\n⚠  No MCP servers were initialized. Continuing without tools...")
             
             # Load tools from initialized servers
             print("\n🔧 Loading tools...")
