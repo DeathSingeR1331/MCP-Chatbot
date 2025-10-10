@@ -28,12 +28,7 @@ except ImportError:
     GROQ_AVAILABLE = False
     logging.warning("Groq client not available. Install with: pip install groq")
 
-try:
-    import ollama
-    OLLAMA_AVAILABLE = True
-except ImportError:
-    OLLAMA_AVAILABLE = False
-    logging.warning("Ollama client not available. Install with: pip install ollama")
+# Ollama removed - only using Groq and Gemini
 
 from test_notion import (
     test_comment_on_page, 
@@ -53,8 +48,6 @@ class LLMProvider(Enum):
     """Enumeration of available LLM providers."""
     GEMINI = "gemini"
     GROQ = "groq"
-    OLLAMA_MISTRAL = "ollama_mistral"
-    OLLAMA_QWEN = "ollama_qwen"
 
 
 class Configuration:
@@ -65,8 +58,8 @@ class Configuration:
         self.load_env()
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
-        self.weather_api_key = os.getenv("WEATHER_API_KEY", "bd59d3a0f641e2c241dbd6091d88e36f")
-        self.ollama_base_url = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+        self.notion_token = os.getenv("NOTION_TOKEN")
+        self.weather_api_key = os.getenv("WEATHER_API_KEY", "08507b919c3b0d939054afb577c46082")
 
     @staticmethod
     def load_env() -> None:
@@ -100,9 +93,6 @@ class Configuration:
         
         if GROQ_AVAILABLE and self.groq_api_key:
             providers.append(LLMProvider.GROQ)
-        
-        if OLLAMA_AVAILABLE:
-            providers.extend([LLMProvider.OLLAMA_MISTRAL, LLMProvider.OLLAMA_QWEN])
         
         return providers
 
@@ -352,10 +342,7 @@ class MultiLLMClient:
         if GROQ_AVAILABLE and self.config.groq_api_key:
             self.groq_client = Groq(api_key=self.config.groq_api_key)
         
-        # Ollama uses base URL from config
-        if OLLAMA_AVAILABLE:
-            # Ollama client uses the base_url automatically
-            pass
+        # Ollama removed - only using Groq and Gemini
 
     def get_response(self, messages: List[Dict[str, str]], provider: Optional[LLMProvider] = None) -> str:
         """Get a response from the selected LLM provider.
@@ -419,10 +406,6 @@ class MultiLLMClient:
             return self._get_gemini_response(messages)
         elif provider == LLMProvider.GROQ:
             return self._get_groq_response(messages)
-        elif provider == LLMProvider.OLLAMA_MISTRAL:
-            return self._get_ollama_response(messages, "mistral:latest")
-        elif provider == LLMProvider.OLLAMA_QWEN:
-            return self._get_ollama_response(messages, "qwen2.5:latest")
         else:
             raise ValueError(f"Unknown provider: {provider}")
 
@@ -458,9 +441,9 @@ class MultiLLMClient:
         try:
             # Try current recommended models in order
             models = [
-                "llama-3.3-70b-versatile",  # Latest Llama 3.3
                 "llama-3.1-8b-instant",      # Fast and efficient
-                "mixtral-8x7b-32768"         # Fallback
+                "llama-3.3-70b-versatile",   # Latest Llama 3.3
+                "llama-3.1-70b-versatile"    # Alternative
             ]
             
             for model in models:
@@ -493,13 +476,7 @@ class MultiLLMClient:
         except Exception as e:
             raise Exception(f"All Groq models failed: {e}")
 
-    def _get_ollama_response(self, messages: List[Dict[str, str]], model: str) -> str:
-        """Get response from Ollama API."""
-        if not OLLAMA_AVAILABLE:
-            raise Exception("Ollama not available")
-        
-        response = ollama.chat(model=model, messages=messages)
-        return response['message']['content'] if response and 'message' in response else "No response generated"
+    # Ollama methods removed - only using Groq and Gemini
 
     def get_weather_data(self, lat: float, lon: float, exclude: str = "minutely,hourly") -> Dict[str, Any]:
         """Get weather data from Open-Meteo API (Free).
@@ -577,6 +554,99 @@ class ChatSession:
             except Exception as e:
                 logging.warning(f"Warning during final cleanup: {e}")
 
+    async def chat(self, user_message: str) -> str:
+        """Process a single user message and return the response.
+        
+        Args:
+            user_message: The user's message to process.
+            
+        Returns:
+            The assistant's response.
+        """
+        try:
+            # Build system message
+            tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
+            
+            system_message = f"""You are a helpful assistant with access to these tools: 
+
+{tools_description}
+
+CRITICAL: You MUST use the EXACT tool names listed above. Common browser tools include:
+- browser_navigate (to navigate to a URL)
+- browser_click_element (to click on elements)
+- browser_take_screenshot (to take screenshots)
+- browser_close (to close the page)
+- browser_resize (to resize browser window)
+- browser_get_current_url (to get current URL)
+- browser_get_page_title (to get page title)
+
+WEATHER TOOL:
+- get_weather (to get current weather for any city)
+  Arguments: {{"city": "city_name"}} (e.g., "New York", "London", "Tokyo")
+
+Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.
+
+IMPORTANT: When you need to use a tool, respond with the exact JSON object format below. For multiple tools or multi-step tasks, provide multiple JSON objects, each on a separate line. Nothing else in the response:
+
+{{
+    "tool": "exact-tool-name-from-list-above",
+    "arguments": {{
+        "argument-name": "value"
+    }}
+}}
+
+SPECIAL INSTRUCTIONS FOR MUSIC/VIDEO PLAYBACK:
+- When user asks to "play" a song/video, you MUST do TWO steps:
+  1. First: Use browser_navigate to go to YouTube search results
+  2. Second: Use browser_click_element to click on the first video result
+- For YouTube searches, use: https://www.youtube.com/results?search_query=SONG_NAME
+- After navigating, click on the first video link to actually play it
+
+For screenshot tools (browser_take_screenshot, puppeteer_screenshot, etc.), always use a path starting with 'images/' (e.g., 'images/screenshot.png') to save in the images folder. Use boolean values for fullPage parameter (true/false, not "true"/"false").
+
+For navigation, use browser_navigate with the "url" argument.
+
+After receiving a tool's response:
+1. Transform the raw data into a natural, conversational response
+2. Keep responses concise but informative
+3. Focus on the most relevant information
+4. Use appropriate context from the user's question
+5. Avoid simply repeating the raw data
+
+Please use only the tools that are explicitly defined above with their EXACT names."""
+
+            messages = [
+                {
+                    "role": "system",
+                    "content": system_message
+                },
+                {
+                    "role": "user",
+                    "content": user_message
+                }
+            ]
+            
+            # Get LLM response
+            llm_response = self.llm_client.get_response(messages)
+            
+            # Process the response and execute tools if needed
+            result = await self.process_llm_response(llm_response)
+            
+            if result != llm_response:
+                # Tool was executed, get final response
+                messages.append({"role": "assistant", "content": llm_response})
+                messages.append({"role": "system", "content": result})
+                
+                final_response = self.llm_client.get_response(messages)
+                return final_response
+            else:
+                # No tool execution, return original response
+                return llm_response
+                
+        except Exception as e:
+            logging.error(f"Error in chat method: {e}")
+            return f"Error processing your request: {str(e)}"
+
     async def process_llm_response(self, llm_response: str) -> str:
         """Process the LLM response and execute tools if needed.
         
@@ -624,30 +694,52 @@ class ChatSession:
             logging.info(f"With arguments: {arguments}")
             
             tool_executed = False
-            for server in self.servers:
+            
+            # Handle weather tool directly
+            if tool_name == "get_weather":
                 try:
-                    tools = await server.list_tools()
-                    if any(tool.name == tool_name for tool in tools):
-                        try:
-                            result = await server.execute_tool(tool_name, arguments)
-                            
-                            if isinstance(result, dict) and 'progress' in result:
-                                progress = result['progress']
-                                total = result['total']
-                                logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
-                            
-                            results.append(f"Tool {tool_name} executed successfully: {result}")
-                            tool_executed = True
-                            break
-                        except Exception as e:
-                            error_msg = f"Error executing tool {tool_name}: {str(e)}"
-                            logging.error(error_msg)
-                            results.append(error_msg)
-                            tool_executed = True
-                            break
+                    city = arguments.get("city", "New York")
+                    weather_data = self.llm_client.get_weather(city)
+                    
+                    if "error" in weather_data:
+                        result = f"Weather API error: {weather_data['error']}"
+                    else:
+                        temp = weather_data.get("main", {}).get("temp", "N/A")
+                        description = weather_data.get("weather", [{}])[0].get("description", "N/A")
+                        humidity = weather_data.get("main", {}).get("humidity", "N/A")
+                        result = f"Weather in {city}: {description}, Temperature: {temp}°C, Humidity: {humidity}%"
+                    
+                    results.append(f"Weather tool executed successfully: {result}")
+                    tool_executed = True
                 except Exception as e:
-                    logging.warning(f"Error listing tools from server {server.name}: {e}")
-                    continue
+                    results.append(f"Error executing weather tool: {str(e)}")
+                    tool_executed = True
+            
+            if not tool_executed:
+                for server in self.servers:
+                    try:
+                        tools = await server.list_tools()
+                        if any(tool.name == tool_name for tool in tools):
+                            try:
+                                result = await server.execute_tool(tool_name, arguments)
+                                
+                                if isinstance(result, dict) and 'progress' in result:
+                                    progress = result['progress']
+                                    total = result['total']
+                                    logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
+                                
+                                results.append(f"Tool {tool_name} executed successfully: {result}")
+                                tool_executed = True
+                                break
+                            except Exception as e:
+                                error_msg = f"Error executing tool {tool_name}: {str(e)}"
+                                logging.error(error_msg)
+                                results.append(error_msg)
+                                tool_executed = True
+                                break
+                    except Exception as e:
+                        logging.warning(f"Error listing tools from server {server.name}: {e}")
+                        continue
             
             if not tool_executed:
                 results.append(f"No server found with tool: {tool_name}")
