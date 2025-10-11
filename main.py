@@ -7,10 +7,12 @@ from typing import Dict, List, Optional, Any
 from enum import Enum
 
 import requests
+import urllib.parse
 from dotenv import load_dotenv
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import base64  # New: For decoding base64 image data
+import subprocess
 
 # LLM Provider imports with availability checking
 try:
@@ -59,7 +61,8 @@ class Configuration:
         self.groq_api_key = os.getenv("GROQ_API_KEY")
         self.gemini_api_key = os.getenv("GEMINI_API_KEY")
         self.notion_token = os.getenv("NOTION_TOKEN")
-        self.weather_api_key = os.getenv("WEATHER_API_KEY", "08507b919c3b0d939054afb577c46082")
+        self.weather_api_key = os.getenv("WEATHER_API_KEY", "44565af3b7bbec06cde35bd8512f44bb")
+        self.news_api_key = os.getenv("NEWS_API_KEY", "6fb893accc5ac91dd59dac3c82bdaf52")
 
     @staticmethod
     def load_env() -> None:
@@ -522,6 +525,57 @@ class MultiLLMClient:
             logging.error(f"Weather API error: {e}")
             return {"error": f"Failed to fetch weather data: {e}"}
 
+    def get_weather(self, city: str) -> Dict[str, Any]:
+        """Get weather data from OpenWeatherMap API for a specific city.
+        
+        Args:
+            city: City name (e.g., "New York", "London", "Tokyo").
+            
+        Returns:
+            Weather data dictionary from OpenWeatherMap API.
+        """
+        url = "https://api.openweathermap.org/data/2.5/weather"
+        params = {
+            'q': city,
+            'appid': self.config.weather_api_key,
+            'units': 'metric'  # Use Celsius
+        }
+        
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"OpenWeatherMap API error: {e}")
+            return {"error": f"Failed to fetch weather data for {city}: {e}"}
+
+    def get_news(self, query: str, max_results: int = 10, language: str = "en") -> Dict[str, Any]:
+        """Get news articles from GNews API.
+        
+        Args:
+            query: Search query for news articles.
+            max_results: Maximum number of articles to return (default: 10).
+            language: Language code (default: "en").
+            
+        Returns:
+            News data dictionary from GNews API.
+        """
+        url = "https://gnews.io/api/v4/search"
+        params = {
+            'q': query,
+            'lang': language,
+            'max': min(max_results, 100),  # GNews API limit is 100
+            'apikey': self.config.news_api_key
+        }
+        
+        try:
+            response = requests.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except requests.exceptions.RequestException as e:
+            logging.error(f"GNews API error: {e}")
+            return {"error": f"Failed to fetch news data for '{query}': {e}"}
+
     def list_available_providers(self) -> List[str]:
         """List available LLM providers."""
         return [provider.value for provider in self.available_providers]
@@ -580,6 +634,13 @@ class ChatSession:
             The assistant's response.
         """
         try:
+            # Special-case: "play <song> on youtube" requests handled directly for reliability
+            lowered = user_message.lower()
+            if ("youtube" in lowered and "play" in lowered) or lowered.startswith("play "):
+                song_query = self._extract_youtube_song_query(lowered)
+                if song_query:
+                    played = await self._play_youtube_song(song_query)
+                    return "✅ Playing on YouTube." if played else "❌ Failed to start playback on YouTube."
             # Build system message
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
             
@@ -589,7 +650,7 @@ class ChatSession:
 
 CRITICAL: You MUST use the EXACT tool names listed above. Common browser tools include:
 - browser_navigate (to navigate to a URL)
-- browser_click_element (to click on elements)
+- browser_click (to click on elements)
 - browser_take_screenshot (to take screenshots)
 - browser_close (to close the page)
 - browser_resize (to resize browser window)
@@ -599,6 +660,10 @@ CRITICAL: You MUST use the EXACT tool names listed above. Common browser tools i
 WEATHER TOOL:
 - get_weather (to get current weather for any city)
   Arguments: {{"city": "city_name"}} (e.g., "New York", "London", "Tokyo")
+
+NEWS TOOL:
+- get_news (to get latest news articles on any topic)
+  Arguments: {{"query": "search_query", "max_results": 10, "language": "en"}} (e.g., "technology", "politics", "sports")
 
 Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.
 
@@ -614,7 +679,7 @@ IMPORTANT: When you need to use a tool, respond with the exact JSON object forma
 SPECIAL INSTRUCTIONS FOR MUSIC/VIDEO PLAYBACK:
 - When user asks to "play" a song/video, you MUST do TWO steps:
   1. First: Use browser_navigate to go to YouTube search results
-  2. Second: Use browser_click_element to click on the first video result
+  2. Second: Use browser_click to click on the first video result
 - For YouTube searches, use: https://www.youtube.com/results?search_query=SONG_NAME
 - After navigating, click on the first video link to actually play it
 
@@ -678,8 +743,13 @@ Please use only the tools that are explicitly defined above with their EXACT nam
         # Split response into individual JSON objects
         tool_calls = []
         try:
+            # Normalize by stripping markdown code fences and newlines
+            normalized = llm_response
+            normalized = re.sub(r"```[a-zA-Z]*", "", normalized)
+            normalized = normalized.replace("```", "")
+            normalized = normalized.replace('\n', '')
             # Extract JSON objects from the response (handles multiple JSON blocks)
-            json_strings = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', llm_response.replace('\n', ''))
+            json_strings = re.findall(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', normalized)
             for json_str in json_strings:
                 try:
                     tool_call = json.loads(json_str)
@@ -710,13 +780,24 @@ Please use only the tools that are explicitly defined above with their EXACT nam
             logging.info(f"With arguments: {arguments}")
             
             tool_executed = False
-            
-            # Handle weather tool directly
-            if tool_name == "get_weather":
+
+            # New local helper tool to robustly play YouTube via Playwright
+            if tool_name == "play_youtube_song":
+                try:
+                    query = arguments.get("query", "")
+                    if not query:
+                        results.append("Missing 'query' for play_youtube_song")
+                    else:
+                        ok = await self._play_via_local_playwright(query)
+                        results.append("YouTube playback started" if ok else "Failed to start YouTube playback")
+                except Exception as e:
+                    results.append(f"Error starting YouTube playback: {e}")
+                tool_executed = True
+
+            elif tool_name == "get_weather":
                 try:
                     city = arguments.get("city", "New York")
                     weather_data = self.llm_client.get_weather(city)
-                    
                     if "error" in weather_data:
                         result = f"Weather API error: {weather_data['error']}"
                     else:
@@ -724,11 +805,39 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                         description = weather_data.get("weather", [{}])[0].get("description", "N/A")
                         humidity = weather_data.get("main", {}).get("humidity", "N/A")
                         result = f"Weather in {city}: {description}, Temperature: {temp}°C, Humidity: {humidity}%"
-                    
                     results.append(f"Weather tool executed successfully: {result}")
                     tool_executed = True
                 except Exception as e:
                     results.append(f"Error executing weather tool: {str(e)}")
+                    tool_executed = True
+
+            elif tool_name == "get_news":
+                try:
+                    query = arguments.get("query", "technology")
+                    max_results = arguments.get("max_results", 10)
+                    language = arguments.get("language", "en")
+                    
+                    news_data = self.llm_client.get_news(query, max_results, language)
+                    if "error" in news_data:
+                        result = f"News API error: {news_data['error']}"
+                    else:
+                        articles = news_data.get("articles", [])
+                        total_articles = news_data.get("totalArticles", 0)
+                        
+                        if articles:
+                            result = f"Found {len(articles)} news articles about '{query}' (Total available: {total_articles}):\n"
+                            for i, article in enumerate(articles[:5], 1):  # Show first 5 articles
+                                title = article.get("title", "No title")
+                                source = article.get("source", {}).get("name", "Unknown source")
+                                published = article.get("publishedAt", "Unknown date")
+                                url = article.get("url", "")
+                                result += f"{i}. {title}\n   Source: {source}\n   Published: {published}\n   URL: {url}\n\n"
+                        else:
+                            result = f"No news articles found for '{query}'"
+                    results.append(f"News tool executed successfully: {result}")
+                    tool_executed = True
+                except Exception as e:
+                    results.append(f"Error executing news tool: {str(e)}")
                     tool_executed = True
             
             if not tool_executed:
@@ -761,30 +870,27 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                 results.append(f"No server found with tool: {tool_name}")
 
         if results:
-            # Combine results and send back to LLM for final response
+            # Determine success/failure and return a concise status message
             combined_result = "\n".join(results)
             logging.info(f"All tool executions completed. Results: {combined_result}")
-            
-            # Create a summary message for the LLM
-            summary_messages = [
-                {
-                    "role": "system", 
-                    "content": f"Tool execution results: {combined_result}\n\nPlease provide a conversational summary of what was accomplished. If the tools executed successfully, confirm the actions were completed. If there were errors, explain what went wrong."
-                },
-                {
-                    "role": "user", 
-                    "content": "Please summarize the tool execution results in a conversational manner."
-                }
-            ]
-            
-            try:
-                final_response = self.llm_client.get_response(summary_messages)
-                return final_response
-            except Exception as e:
-                logging.error(f"Error getting final response from LLM: {e}")
-                return f"Tools executed. Results: {combined_result}"
+            is_success = any("executed successfully" in r for r in results) and not any("Error" in r for r in results)
+            if is_success:
+                return "✅ Task completed successfully."
+            if any("Error" in r for r in results):
+                return "❌ Task failed during tool execution."
+            return "ℹ️ Tools executed."
         
         return llm_response
+
+    async def _play_via_local_playwright(self, query: str) -> bool:
+        """Spawn a short-lived Playwright Python process to play first YouTube result."""
+        try:
+            code = f'''import asyncio\nfrom playwright.async_api import async_playwright\nVIDEO_QUERY={query!r}\nasync def main():\n    async with async_playwright() as p:\n        browser = await p.chromium.launch(headless=False, args=["--autoplay-policy=no-user-gesture-required"])\n        ctx = await browser.new_context(permissions=["microphone","camera"])\n        page = await ctx.new_page()\n        await page.goto("https://www.youtube.com/results?search_query=" + VIDEO_QUERY.replace(" ", "+"))\n        first = page.locator('ytd-video-renderer a#thumbnail').first\n        await first.click()\n        await page.wait_for_selector("video")\n        try:\n            await page.get_by_role("button", name="Play").click(timeout=2000)\n        except Exception: pass\n        await page.wait_for_timeout(5000)\nasyncio.run(main())\n'''
+            proc = subprocess.Popen([sys.executable, "-c", code])
+            return proc is not None
+        except Exception as e:
+            logging.error(f"Local Playwright spawn failed: {e}")
+            return False
 
     def show_help(self) -> None:
         """Show available commands and options."""
@@ -897,6 +1003,115 @@ Please use only the tools that are explicitly defined above with their EXACT nam
             print(f"❌ Unknown command: {cmd}. Type /help for available commands.\n")
         
         return False
+
+    def _extract_youtube_song_query(self, lowered: str) -> Optional[str]:
+        """Extract the song/video query from a user instruction mentioning YouTube playback."""
+        import re
+        # Patterns: "play <song> on youtube", "open youtube and play <song>", "play <song>"
+        m = re.search(r"play\s+(.*?)\s+(?:on|in)\s+youtube\b", lowered)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        m2 = re.search(r"open\s+youtube.*?play\s+(.+)$", lowered)
+        if m2 and m2.group(1).strip():
+            return m2.group(1).strip()
+        m3 = re.search(r"^play\s+(.+)$", lowered)
+        if m3 and m3.group(1).strip():
+            return m3.group(1).strip()
+        return None
+
+    async def _play_youtube_song(self, query: str) -> bool:
+        """Automate YouTube playback using available browser tools.
+
+        Strategy: navigate to results page, click first result, ensure video.play().
+        """
+        try:
+            search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
+
+            # Discover a server that supports playwright-style tools
+            for server in self.servers:
+                if not server.session:
+                    continue
+                try:
+                    tools = await server.list_tools()
+                    tool_names = {t.name for t in tools}
+                except Exception:
+                    continue
+
+                # Prefer Playwright, fall back to Puppeteer
+                if {"browser_navigate", "browser_evaluate"}.issubset(tool_names):
+                    # Step 1: navigate
+                    await server.execute_tool("browser_navigate", {"url": search_url})
+                    # Step 2: click the first video result via DOM
+                    click_js = """
+                    () => {
+                      const link = document.querySelector('ytd-video-renderer a#video-title, ytd-video-renderer a#thumbnail');
+                      if (link && link.href) { window.location.href = link.href; return true; }
+                      if (link) { link.click(); return true; }
+                      return false;
+                    }
+                    """
+                    # Try dedicated click if available; otherwise evaluate
+                    if "browser_click" in tool_names:
+                        # Click the first video's title link
+                        # Use accessibility role/name when possible
+                        await server.execute_tool("browser_click", {"element": "First search result title link", "ref": "auto"})
+                    else:
+                        await server.execute_tool("browser_evaluate", {"function": click_js})
+                    # Step 3: wait for navigation and ensure playback with retries
+                    import asyncio as _asyncio
+                    for _ in range(12):
+                        play_js = """
+                        () => {
+                          const btn = document.querySelector('.ytp-play-button');
+                          if (btn && btn.getAttribute('data-title-no-tooltip') === 'Play') { btn.click(); }
+                          const v = document.querySelector('video');
+                          if (!v) return false;
+                          try { v.muted = false; const p = v.play?.(); if (p && typeof p.then === 'function') { /* ignore */ } } catch (e) {}
+                          return !v.paused;
+                        }
+                        """
+                        result = await server.execute_tool("browser_evaluate", {"function": play_js})
+                        if result:
+                            return True
+                        await _asyncio.sleep(0.75)
+                    return False
+
+                if {"puppeteer_navigate", "puppeteer_evaluate"}.issubset(tool_names):
+                    await server.execute_tool("puppeteer_navigate", {"url": search_url})
+                    click_js = """
+                    () => {
+                      const link = document.querySelector('ytd-video-renderer a#video-title, ytd-video-renderer a#thumbnail');
+                      if (link && link.href) { window.location.href = link.href; return true; }
+                      if (link) { link.click(); return true; }
+                      return false;
+                    }
+                    """
+                    if "puppeteer_click" in tool_names:
+                        await server.execute_tool("puppeteer_click", {"selector": "ytd-video-renderer a#thumbnail, ytd-video-renderer a#video-title"})
+                    else:
+                        await server.execute_tool("puppeteer_evaluate", {"script": click_js})
+                    import asyncio as _asyncio
+                    for _ in range(12):
+                        play_js = """
+                        () => {
+                          const btn = document.querySelector('.ytp-play-button');
+                          if (btn && btn.getAttribute('data-title-no-tooltip') === 'Play') { btn.click(); }
+                          const v = document.querySelector('video');
+                          if (!v) return false;
+                          try { v.muted = false; const p = v.play?.(); if (p && typeof p.then === 'function') { /* ignore */ } } catch (e) {}
+                          return !v.paused;
+                        }
+                        """
+                        result = await server.execute_tool("puppeteer_evaluate", {"script": play_js})
+                        if result:
+                            return True
+                        await _asyncio.sleep(0.75)
+                    return False
+
+            return False
+        except Exception as e:
+            logging.error(f"YouTube playback automation failed: {e}")
+            return False
 
     async def start(self) -> None:
         """Main chat session handler."""

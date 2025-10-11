@@ -1,45 +1,39 @@
 {
     "mcpServers": {
-        "playwright": {
-            "command": "npx",
-            "args": [
-                "@playwright/mcp@latest"
-            ],
-            "env": {
-                "DISPLAY": ":1"
-            }
-        },
-        "airbnb": {
-            "command": "npx",
-            "args": [
-                "-y",
-                "@openbnb/mcp-server-airbnb"
-            ]
-        },
-        "sqlite": {
-            "command": "uvx",
-            "args": [
-                "mcp-server-sqlite",
-                "--db-path",
-                "./test.db"
-            ]
-        },
-        "puppeteer": {
-            "command": "npx",
-            "args": [
-                "-y",
-                "@modelcontextprotocol/server-puppeteer"
-            ]
-        },
-        "notionApi": {
-            "command": "npx",
-            "args": [
-                "-y",
-                "@notionhq/notion-mcp-server"
-            ],
-            "env": {
-                "NOTION_TOKEN": "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"
-            }
+      "playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "env": { "DISPLAY": ":1" }
+      },
+      "airbnb": {
+        "command": "npx",
+        "args": ["-y", "@openbnb/mcp-server-airbnb"]
+      },
+      "sqlite": {
+        "command": "uvx",
+        "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
+      },
+      "puppeteer": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+      },
+      "notionApi": {
+        "command": "npx",
+        "args": [
+            "-y",
+            "@notionhq/notion-mcp-server"
+        ],
+        "env": {
+            "NOTION_TOKEN": "YOUR_NOTION_TOKEN_HERE"
         }
+      },
+      "windowsClock": {
+        "command": "python",
+        "args": ["mcp-windows-clock.py"]
+      },
+      "windowsScheduler": {
+        "command": "python",
+        "args": ["mcp-windows-scheduler.py"]
+      }
     }
 }
