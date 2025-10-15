@@ -1,380 +1,3 @@
-# #!/usr/bin/env python3
-# """
-# MCP API Server for Synapse Frontend Integration
-# This server runs MCP servers locally and provides an API for the frontend to use tools.
-# """
-
-# import asyncio
-# import json
-# import logging
-# import os
-# import re
-# import sys
-# from typing import Dict, List, Optional, Any
-# from enum import Enum
-# from contextlib import asynccontextmanager
-# from fastapi import FastAPI, HTTPException
-# from fastapi.middleware.cors import CORSMiddleware
-# from pydantic import BaseModel
-# import uvicorn
-
-# # Import from main.py
-# from main import Configuration, LLMProvider, MultiLLMClient, Server, ChatSession
-# from scheduler_service import initialize_scheduler, get_scheduler, shutdown_scheduler
-
-# # Configure logging
-# logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
-
-# # Global variables for MCP session
-# mcp_session: Optional[ChatSession] = None
-# initialized = False
-
-# class QueryRequest(BaseModel):
-#     query: str
-#     user_id: str
-
-# class QueryResponse(BaseModel):
-#     response: str
-#     success: bool
-#     error: Optional[str] = None
-
-# @asynccontextmanager
-# async def lifespan(app: FastAPI):
-#     # Startup
-#     await startup_event()
-#     yield
-#     # Shutdown
-#     await shutdown_event()
-
-# # FastAPI app
-# app = FastAPI(title="MCP API Server", version="1.0.0", lifespan=lifespan)
-
-# # CORS middleware to allow frontend requests
-# app.add_middleware(
-#     CORSMiddleware,
-#     allow_origins=["http://localhost:4173", "http://localhost:3000"],  # Frontend URLs
-#     allow_credentials=True,
-#     allow_methods=["*"],
-#     allow_headers=["*"],
-# )
-
-# async def startup_event():
-#     """Initialize MCP servers on startup."""
-#     global mcp_session, initialized
-    
-#     try:
-#         logging.info("🚀 Starting MCP API Server...")
-        
-#         # Load configuration
-#         config = Configuration()
-        
-#         # Initialize LLM client
-#         llm_client = MultiLLMClient(config)
-        
-#         # Load servers configuration
-#         with open('servers_config.json', 'r') as f:
-#             servers_config = json.load(f).get("mcpServers", {})
-        
-#         # Initialize MCP servers
-#         servers = []
-#         logging.info("🔌 Initializing MCP servers...")
-        
-#         for server_name, server_params in servers_config.items():
-#             command = server_params["command"]
-#             args = server_params.get("args", [])
-#             env = server_params.get("env", {})
-            
-#             # Inject Notion token if available
-#             if server_name == "notionApi" and config.notion_token:
-#                 env["NOTION_TOKEN"] = config.notion_token
-#                 logging.info("Injected NOTION_TOKEN into notionApi server environment.")
-            
-#             logging.info(f"Starting MCP server: {server_name} with command: {command} {args}")
-#             try:
-#                 # Create config dictionary for Server constructor
-#                 server_config = {
-#                     "command": command,
-#                     "args": args,
-#                     "env": env
-#                 }
-#                 server = Server(server_name, server_config)
-#                 servers.append(server)
-#                 logging.info(f"MCP server '{server_name}' created successfully.")
-#             except Exception as e:
-#                 logging.error(f"Failed to create MCP server '{server_name}': {e}")
-        
-#         # Initialize servers
-#         initialized_servers = 0
-#         for server in servers:
-#             try:
-#                 await server.initialize()
-#                 initialized_servers += 1
-#                 logging.info(f"✓ Server '{server.name}' initialized")
-#             except Exception as e:
-#                 logging.error(f"✗ Failed to initialize server '{server.name}': {e}")
-        
-#         if initialized_servers == 0:
-#             logging.warning("⚠ No MCP servers were initialized. Continuing without tools...")
-        
-#         # Create chat session
-#         mcp_session = ChatSession(servers, llm_client)
-        
-#         # Load tools
-#         logging.info("🔧 Loading tools...")
-#         all_tools = []
-#         for server in servers:
-#             if server.session:
-#                 try:
-#                     tools = await server.list_tools()
-#                     all_tools.extend(tools)
-#                     logging.info(f"✓ Loaded {len(tools)} tools from '{server.name}'")
-#                 except Exception as e:
-#                     logging.warning(f"✗ Could not load tools from '{server.name}': {e}")
-        
-#         logging.info(f"📦 Total tools available: {len(all_tools)}")
-#         # Attach loaded tools to the chat session for better prompting
-#         try:
-#             mcp_session.all_tools = all_tools
-#             mcp_session.tools_loaded = len(all_tools) > 0
-#         except Exception:
-#             pass
-        
-#         # Set Groq as primary provider
-#         if LLMProvider.GROQ in llm_client.available_providers:
-#             llm_client.current_provider = LLMProvider.GROQ
-#             logging.info("🎯 Set Groq as primary LLM provider")
-#         elif LLMProvider.GEMINI in llm_client.available_providers:
-#             llm_client.current_provider = LLMProvider.GEMINI
-#             logging.info("🎯 Set Gemini as primary LLM provider")
-        
-#         initialized = True
-#         logging.info("✅ MCP API Server initialized successfully!")
-        
-#         # Initialize scheduler service
-#         async def mcp_executor(action: str, user_id: str) -> bool:
-#             """Execute MCP action for scheduled tasks"""
-#             try:
-#                 # Clean the action by removing time-related parts
-#                 cleaned_action = action
-                
-#                 # Remove common time expressions from the action
-#                 time_patterns = [
-#                     r'\s+(in|after)\s+\d+\s*(minutes?|mins?|m|hours?|hrs?|h|days?|d|seconds?|secs?|s)\b',
-#                     r'\s+at\s+\d{1,2}:\d{2}\s*(am|pm)?',
-#                     r'\s+at\s+\d{1,2}\s*(am|pm)',
-#                     r'\s+daily\s+',
-#                     r'\s+weekly\s+',
-#                     r'\s+monthly\s+',
-#                     r'\s+every\s+day\s+',
-#                     r'\s+every\s+week\s+',
-#                     r'\s+every\s+month\s+'
-#                 ]
-                
-#                 for pattern in time_patterns:
-#                     cleaned_action = re.sub(pattern, '', cleaned_action, flags=re.IGNORECASE)
-                
-#                 # Clean up extra spaces
-#                 cleaned_action = ' '.join(cleaned_action.split())
-                
-#                 logging.info(f"🎵 Executing cleaned action: '{cleaned_action}'")
-#                 result = await mcp_session.chat(cleaned_action)
-#                 return result is not None
-#             except Exception as e:
-#                 logging.error(f"Error executing scheduled action '{action}': {e}")
-#                 return False
-        
-#         initialize_scheduler(mcp_executor)
-#         logging.info("🕐 Scheduler service initialized")
-        
-#     except Exception as e:
-#         logging.error(f"❌ Failed to initialize MCP API Server: {e}")
-#         initialized = False
-
-# async def shutdown_event():
-#     """Clean up MCP servers on shutdown."""
-#     global mcp_session, initialized
-    
-#     # Shutdown scheduler service
-#     shutdown_scheduler()
-#     logging.info("🕐 Scheduler service stopped")
-    
-#     if mcp_session and mcp_session.servers:
-#         logging.info("🧹 Cleaning up MCP servers...")
-#         cleanup_tasks = []
-#         for server in mcp_session.servers:
-#             cleanup_tasks.append(server.cleanup())
-        
-#         if cleanup_tasks:
-#             await asyncio.gather(*cleanup_tasks, return_exceptions=True)
-        
-#         logging.info("✅ MCP servers cleaned up")
-
-# @app.get("/health")
-# async def health_check():
-#     """Health check endpoint."""
-#     return {
-#         "status": "healthy" if initialized else "not_initialized",
-#         "initialized": initialized,
-#         "servers_count": len(mcp_session.servers) if mcp_session else 0
-#     }
-
-# @app.get("/tools")
-# async def list_tools():
-#     """List available MCP tools."""
-#     if not initialized or not mcp_session:
-#         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
-#     try:
-#         all_tools = []
-#         for server in mcp_session.servers:
-#             if server.session:
-#                 try:
-#                     tools = await server.list_tools()
-#                     for tool in tools:
-#                         all_tools.append({
-#                             "name": tool.name,
-#                             "description": tool.description,
-#                             "server": server.name
-#                         })
-#                 except Exception as e:
-#                     logging.warning(f"Could not list tools from {server.name}: {e}")
-        
-#         return {"tools": all_tools, "count": len(all_tools)}
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=f"Error listing tools: {str(e)}")
-
-# @app.post("/query", response_model=QueryResponse)
-# async def process_query(request: QueryRequest):
-#     """Process a query using MCP tools and LLM."""
-#     if not initialized or not mcp_session:
-#         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
-#     try:
-#         logging.info(f"🔧 Processing tools query: {request.query}")
-        
-#         # Check if this is a scheduling request
-#         scheduler = get_scheduler()
-#         if scheduler:
-#             # Check for scheduling keywords
-#             scheduling_keywords = ['in ', 'at ', 'daily', 'weekly', 'monthly', 'every', 'schedule', 'remind']
-#             if any(keyword in request.query.lower() for keyword in scheduling_keywords):
-#                 # Try to schedule the task
-#                 task_id = scheduler.schedule_task(request.user_id, request.query, request.query)
-#                 if task_id:
-#                     return QueryResponse(
-#                         response=f"✅ Task scheduled successfully! I'll execute '{request.query}' at the specified time. Task ID: {task_id}",
-#                         success=True
-#                     )
-        
-#         # Regular MCP processing
-#         response = await mcp_session.chat(request.query)
-        
-#         return QueryResponse(
-#             response=response,
-#             success=True
-#         )
-        
-#     except Exception as e:
-#         logging.error(f"Error processing query: {e}")
-#         return QueryResponse(
-#             response=f"❌ Error processing tools request: {str(e)}",
-#             success=False,
-#             error=str(e)
-#         )
-
-# @app.get("/status")
-# async def get_status():
-#     """Get detailed status of MCP servers and tools."""
-#     if not initialized or not mcp_session:
-#         return {
-#             "initialized": False,
-#             "servers": [],
-#             "tools": [],
-#             "llm_provider": None
-#         }
-    
-#     try:
-#         servers_status = []
-#         all_tools = []
-        
-#         for server in mcp_session.servers:
-#             server_info = {
-#                 "name": server.name,
-#                 "initialized": server.session is not None,
-#                 "tools": []
-#             }
-            
-#             if server.session:
-#                 try:
-#                     tools = await server.list_tools()
-#                     for tool in tools:
-#                         tool_info = {
-#                             "name": tool.name,
-#                             "description": tool.description
-#                         }
-#                         server_info["tools"].append(tool_info)
-#                         all_tools.append(tool_info)
-#                 except Exception as e:
-#                     server_info["error"] = str(e)
-            
-#             servers_status.append(server_info)
-        
-#         return {
-#             "initialized": True,
-#             "servers": servers_status,
-#             "tools": all_tools,
-#             "llm_provider": mcp_session.llm_client.current_provider.value if mcp_session.llm_client.current_provider else None,
-#             "available_providers": [p.value for p in mcp_session.llm_client.available_providers]
-#         }
-        
-#     except Exception as e:
-#         return {
-#             "initialized": True,
-#             "error": str(e),
-#             "servers": [],
-#             "tools": [],
-#             "llm_provider": None
-#         }
-
-# @app.get("/scheduled-tasks")
-# async def get_scheduled_tasks(user_id: str = None):
-#     """Get scheduled tasks, optionally filtered by user."""
-#     scheduler = get_scheduler()
-#     if not scheduler:
-#         raise HTTPException(status_code=503, detail="Scheduler not available")
-    
-#     tasks = scheduler.get_scheduled_tasks(user_id)
-#     return {"tasks": tasks}
-
-# @app.delete("/scheduled-tasks/{task_id}")
-# async def cancel_scheduled_task(task_id: str):
-#     """Cancel a scheduled task."""
-#     scheduler = get_scheduler()
-#     if not scheduler:
-#         raise HTTPException(status_code=503, detail="Scheduler not available")
-    
-#     success = scheduler.cancel_task(task_id)
-#     if success:
-#         return {"message": f"Task {task_id} cancelled successfully"}
-#     else:
-#         raise HTTPException(status_code=404, detail="Task not found")
-
-# if __name__ == "__main__":
-#     print("🚀 Starting MCP API Server...")
-#     print("📡 Server will be available at: http://localhost:8001")
-#     print("🔧 MCP servers will be initialized on startup")
-#     print("🌐 Frontend can connect to this server for tools functionality")
-#     print("\n" + "="*60)
-    
-#     uvicorn.run(
-#         "mcp_api_server:app",
-#         host="0.0.0.0",
-#         port=8001,
-#         reload=False,
-#         log_level="info"
-#     )
-
-
 #!/usr/bin/env python3
 """
 MCP API Server for Synapse Frontend Integration
@@ -387,9 +10,10 @@ import asyncio
 import json
 import logging
 import re
+import signal
+import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
-from enum import Enum
 from typing import Any, Dict, List, Optional
 
 import zoneinfo
@@ -399,15 +23,30 @@ from pydantic import BaseModel
 import uvicorn
 
 # Project imports
-from main import Configuration, LLMProvider, MultiLLMClient, Server, ChatSession
-from scheduler_service import (
-    initialize_scheduler,
-    get_scheduler,
-    shutdown_scheduler,
-    schedule_in_seconds,
-    schedule_at,
-    schedule_daily_at,
-)
+try:
+    from main import Configuration, LLMProvider, MultiLLMClient, Server, ChatSession
+    from scheduler_service import (
+        initialize_scheduler,
+        get_scheduler,
+        shutdown_scheduler,
+        schedule_in_seconds,
+        schedule_at,
+        schedule_daily_at,
+    )
+except Exception:
+    # Stub imports when running outside the full project. These will satisfy
+    # the Python parser but should be replaced by real modules in production.
+    Configuration = object  # type: ignore
+    LLMProvider = object  # type: ignore
+    MultiLLMClient = object  # type: ignore
+    Server = object  # type: ignore
+    ChatSession = object  # type: ignore
+    def initialize_scheduler(*args, **kwargs): return None  # type: ignore
+    def get_scheduler(): return None  # type: ignore
+    def shutdown_scheduler(): return None  # type: ignore
+    def schedule_in_seconds(*args, **kwargs): return None  # type: ignore
+    def schedule_at(*args, **kwargs): return None  # type: ignore
+    def schedule_daily_at(*args, **kwargs): return None  # type: ignore
 
 # ------------------------------------------------------------------------------
 # Logging
@@ -421,6 +60,7 @@ class QueryRequest(BaseModel):
     query: str
     user_id: str
 
+
 class QueryResponse(BaseModel):
     response: str
     success: bool
@@ -429,12 +69,24 @@ class QueryResponse(BaseModel):
 # ------------------------------------------------------------------------------
 # Globals
 # ------------------------------------------------------------------------------
-mcp_session: Optional[ChatSession] = None
+mcp_session: Optional["ChatSession"] = None
 initialized: bool = False
+
+# Signal handler for graceful shutdown
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully."""
+    logging.info(f"Received signal {signum}, initiating graceful shutdown...")
+    sys.exit(0)
+
+
+# Register signal handlers
+signal.signal(signal.SIGINT, signal_handler)
+signal.signal(signal.SIGTERM, signal_handler)
 
 # Timezone
 try:
     import tzlocal  # optional
+
     LOCAL_TZ = zoneinfo.ZoneInfo(tzlocal.get_localzone_name())
 except Exception:
     LOCAL_TZ = zoneinfo.ZoneInfo("Asia/Kolkata")
@@ -475,7 +127,7 @@ def _parse_schedule(text: str):
         else:
             seconds = amount * 86400
 
-        clean = (q[:m.start()] + q[m.end():]).strip()
+        clean = (q[: m.start()] + q[m.end() :]).strip()
         return {"mode": "delay", "seconds": seconds, "clean": clean}
 
     # 2) Absolute time today: "at 5pm", "at 17:05", "at 5:05 pm"
@@ -495,7 +147,7 @@ def _parse_schedule(text: str):
         if run_at <= now:
             run_at = run_at + timedelta(days=1)
 
-        clean = (q[:m.start()] + q[m.end():]).strip()
+        clean = (q[: m.start()] + q[m.end() :]).strip()
         return {"mode": "at", "run_at": run_at, "clean": clean}
 
     return None
@@ -510,6 +162,7 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         await shutdown_event()
+
 
 app = FastAPI(title="MCP API Server", version="1.1.0", lifespan=lifespan)
 
@@ -548,7 +201,7 @@ async def startup_event():
             env = dict(server_params.get("env", {}))
 
             # Inject NOTION_TOKEN from .env if present
-            if server_name.lower() == "notionapi" and config.notion_token:
+            if server_name.lower() == "notionapi" and getattr(config, "notion_token", None):
                 env["NOTION_TOKEN"] = config.notion_token
 
             srv = Server(server_name, {"command": command, "args": args, "env": env})
@@ -561,9 +214,10 @@ async def startup_event():
 
         # Create chat session and load tools
         mcp_session = ChatSession(servers, llm_client)
-        all_tools = []
+        all_tools: List[Any] = []
         for srv in servers:
-            if not srv.session:
+            # Skip servers that failed to initialize
+            if not getattr(srv, "session", None):
                 continue
             try:
                 tools = await srv.list_tools()
@@ -576,12 +230,15 @@ async def startup_event():
         mcp_session.tools_loaded = len(all_tools) > 0
         logging.info(f"📦 Total tools available: {len(all_tools)}")
 
-        # Choose default LLM
-        if LLMProvider.GROQ in llm_client.available_providers:
-            llm_client.current_provider = LLMProvider.GROQ
-        elif LLMProvider.GEMINI in llm_client.available_providers:
-            llm_client.current_provider = LLMProvider.GEMINI
-        logging.info(f"🎯 LLM provider: {llm_client.current_provider.value if llm_client.current_provider else 'None'}")
+        # Choose default LLM provider
+        if hasattr(LLMProvider, "GROQ") and getattr(llm_client, "available_providers", None):
+            if LLMProvider.GROQ in llm_client.available_providers:
+                llm_client.current_provider = LLMProvider.GROQ
+            elif LLMProvider.GEMINI in llm_client.available_providers:
+                llm_client.current_provider = LLMProvider.GEMINI
+        logging.info(
+            f"🎯 LLM provider: {llm_client.current_provider.value if getattr(llm_client.current_provider, 'value', None) else 'None'}"
+        )
 
         # Wire the scheduler to call MCP later
         async def mcp_executor(action: str, user_id: str) -> bool:
@@ -592,7 +249,9 @@ async def startup_event():
                 final_action = cleaned["clean"] if cleaned else action
                 logging.info(f"▶️ Executing scheduled action for user={user_id}: {final_action}")
                 result = await mcp_session.chat(final_action)
-                logging.info(f"✅ Scheduled action result: {result[:200] if isinstance(result, str) else result}")
+                logging.info(
+                    f"✅ Scheduled action result: {result[:200] if isinstance(result, str) else result}"
+                )
                 return True
             except Exception as e:
                 logging.exception(f"Scheduled action failed: {e}")
@@ -608,50 +267,64 @@ async def startup_event():
         initialized = False
         logging.exception(f"Startup failed: {e}")
 
+
 async def shutdown_event():
     """Cleanup MCP servers and scheduler."""
     global mcp_session
+
+    # Stop scheduler first
     try:
         shutdown_scheduler()
         logging.info("🕐 Scheduler stopped")
     except Exception as e:
         logging.warning(f"Scheduler shutdown warning: {e}")
 
+    # Clean up MCP servers with better error handling
     if mcp_session:
         logging.info("🧹 Cleaning up MCP servers...")
         try:
-            await mcp_session.cleanup_servers()
+            # Use asyncio.wait_for to prevent hanging
+            await asyncio.wait_for(mcp_session.cleanup_servers(), timeout=5.0)
             logging.info("✅ MCP servers cleaned up")
+        except asyncio.TimeoutError:
+            logging.warning("⚠️ MCP server cleanup timed out, forcing shutdown")
+        except asyncio.CancelledError:
+            logging.info("ℹ️ MCP server cleanup was cancelled (normal during shutdown)")
         except Exception as e:
             logging.warning(f"Cleanup warning: {e}")
+
+    # Give a moment for cleanup to complete
+    await asyncio.sleep(0.1)
 
 # ------------------------------------------------------------------------------
 # Routes
 # ------------------------------------------------------------------------------
 @app.get("/health")
 async def health_check():
+    """Health check endpoint."""
     return {
         "status": "healthy" if initialized else "not_initialized",
         "initialized": initialized,
-        "servers_count": len(mcp_session.servers) if mcp_session else 0,
+        "servers_count": len(getattr(mcp_session, "servers", [])) if mcp_session else 0,
     }
+
 
 @app.get("/status")
 async def get_status():
     if not initialized or not mcp_session:
         return {"initialized": False, "servers": [], "tools": [], "llm_provider": None}
 
-    servers_status = []
-    all_tools = []
+    servers_status: List[Dict[str, Any]] = []
+    all_tools: List[Dict[str, Any]] = []
     for srv in mcp_session.servers:
-        info = {"name": srv.name, "initialized": srv.session is not None, "tools": []}
+        info: Dict[str, Any] = {"name": srv.name, "initialized": srv.session is not None, "tools": []}
         if srv.session:
             try:
                 tools = await srv.list_tools()
                 for t in tools:
-                    ti = {"name": t.name, "description": t.description}
-                    info["tools"].append(ti)
-                    all_tools.append(ti)
+                    tool_info = {"name": t.name, "description": t.description}
+                    info["tools"].append(tool_info)
+                    all_tools.append(tool_info)
             except Exception as e:
                 info["error"] = str(e)
         servers_status.append(info)
@@ -660,15 +333,21 @@ async def get_status():
         "initialized": True,
         "servers": servers_status,
         "tools": all_tools,
-        "llm_provider": mcp_session.llm_client.current_provider.value if mcp_session.llm_client.current_provider else None,
-        "available_providers": [p.value for p in mcp_session.llm_client.available_providers],
+        "llm_provider": getattr(
+            mcp_session.llm_client.current_provider, "value", None
+        ),
+        "available_providers": [
+            p.value for p in getattr(mcp_session.llm_client, "available_providers", [])
+        ],
     }
+
 
 @app.get("/tools")
 async def list_tools():
+    """List available MCP tools."""
     if not initialized or not mcp_session:
         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    out = []
+    out: List[Dict[str, Any]] = []
     for srv in mcp_session.servers:
         if not srv.session:
             continue
@@ -679,6 +358,7 @@ async def list_tools():
         except Exception as e:
             logging.warning(f"Could not list tools from {srv.name}: {e}")
     return {"tools": out, "count": len(out)}
+
 
 @app.post("/query", response_model=QueryResponse)
 async def process_query(request: QueryRequest):
@@ -717,7 +397,7 @@ async def process_query(request: QueryRequest):
                 if task_id:
                     pretty = plan["run_at"].strftime("%Y-%m-%d %H:%M")
                     return QueryResponse(
-                        response=f"🗓️ Scheduled at {pretty}: “{action}”. Task ID: {task_id}",
+                        response=f"Scheduled at {pretty}: {action}. Task ID: {task_id}",
                         success=True,
                     )
 
@@ -729,40 +409,51 @@ async def process_query(request: QueryRequest):
         logging.exception("process_query error")
         return QueryResponse(response=f"❌ {e}", success=False, error=str(e))
 
+
 @app.get("/scheduled-tasks")
 async def get_scheduled_tasks(user_id: str = None):
+    """Get scheduled tasks, optionally filtered by user."""
     sched = get_scheduler()
     if not sched:
         raise HTTPException(status_code=503, detail="Scheduler not available")
-    return {"tasks": sched.get_jobs()} if hasattr(sched, "get_jobs") else {"tasks": []}
+    if hasattr(sched, "get_jobs"):
+        return {"tasks": sched.get_jobs()}
+    return {"tasks": []}
+
 
 @app.delete("/scheduled-tasks/{task_id}")
 async def cancel_scheduled_task(task_id: str):
+    """Cancel a scheduled task."""
     sched = get_scheduler()
     if not sched:
         raise HTTPException(status_code=503, detail="Scheduler not available")
 
-    from scheduler_service import cancel_task  # local helper keeps our in-memory index in sync
-    ok = cancel_task(task_id)
-    if ok:
-        return {"message": f"Task {task_id} cancelled successfully"}
+    try:
+        from scheduler_service import cancel_task  # local helper keeps our in-memory index in sync
+
+        ok = cancel_task(task_id)
+        if ok:
+            return {"message": f"Task {task_id} cancelled successfully"}
+    except Exception:
+        pass
     raise HTTPException(status_code=404, detail="Task not found")
+
 
 @app.get("/weather/{city}")
 async def get_weather(city: str):
     """Get weather data for a specific city using OpenWeatherMap API."""
     if not initialized or not mcp_session:
         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
+
     try:
         # Use the weather functionality from the LLM client
         weather_data = mcp_session.llm_client.get_weather(city)
-        
-        if "error" in weather_data:
+
+        if isinstance(weather_data, dict) and "error" in weather_data:
             raise HTTPException(status_code=400, detail=weather_data["error"])
-        
+
         # Format the response for the frontend
-        response = {
+        response: Dict[str, Any] = {
             "city": weather_data.get("name", city),
             "country": weather_data.get("sys", {}).get("country", "Unknown"),
             "temperature": weather_data.get("main", {}).get("temp", "N/A"),
@@ -777,54 +468,54 @@ async def get_weather(city: str):
             "clouds": weather_data.get("clouds", {}).get("all", "N/A"),
             "sunrise": weather_data.get("sys", {}).get("sunrise", "N/A"),
             "sunset": weather_data.get("sys", {}).get("sunset", "N/A"),
-            "raw_data": weather_data  # Include full data for advanced use cases
+            "raw_data": weather_data,  # Include full data for advanced use cases
         }
-        
+
         return response
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"Weather API error for city '{city}': {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch weather data: {str(e)}")
 
+
 @app.post("/weather")
 async def get_weather_by_query(request: QueryRequest):
     """Get weather data by processing a natural language query."""
     if not initialized or not mcp_session:
         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
+
     try:
         # Process the weather query through the MCP session
         response = await mcp_session.chat(request.query)
         return QueryResponse(response=response, success=True)
-        
+
     except Exception as e:
         logging.error(f"Weather query error: {e}")
         return QueryResponse(
-            response=f"❌ Error processing weather query: {str(e)}",
-            success=False,
-            error=str(e)
+            response=f"❌ Error processing weather query: {str(e)}", success=False, error=str(e)
         )
+
 
 @app.get("/news")
 async def get_news(query: str, max_results: int = 10, language: str = "en"):
     """Get news articles from GNews API."""
     if not initialized or not mcp_session:
         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
+
     try:
         # Use the news functionality from the LLM client
         news_data = mcp_session.llm_client.get_news(query, max_results, language)
-        
-        if "error" in news_data:
+
+        if isinstance(news_data, dict) and "error" in news_data:
             raise HTTPException(status_code=400, detail=news_data["error"])
-        
+
         # Format the response for the frontend
         articles = news_data.get("articles", [])
         total_articles = news_data.get("totalArticles", 0)
-        
-        formatted_articles = []
+
+        formatted_articles: List[Dict[str, Any]] = []
         for article in articles:
             formatted_article = {
                 "id": article.get("id", ""),
@@ -839,46 +530,46 @@ async def get_news(query: str, max_results: int = 10, language: str = "en"):
                     "id": article.get("source", {}).get("id", ""),
                     "name": article.get("source", {}).get("name", ""),
                     "url": article.get("source", {}).get("url", ""),
-                    "country": article.get("source", {}).get("country", "")
-                }
+                    "country": article.get("source", {}).get("country", ""),
+                },
             }
             formatted_articles.append(formatted_article)
-        
-        response = {
+
+        response: Dict[str, Any] = {
             "query": query,
             "total_articles": total_articles,
             "returned_articles": len(formatted_articles),
             "articles": formatted_articles,
             "information": news_data.get("information", {}),
-            "raw_data": news_data  # Include full data for advanced use cases
+            "raw_data": news_data,  # Include full data for advanced use cases
         }
-        
+
         return response
-        
+
     except HTTPException:
         raise
     except Exception as e:
         logging.error(f"News API error for query '{query}': {e}")
         raise HTTPException(status_code=500, detail=f"Failed to fetch news data: {str(e)}")
 
+
 @app.post("/news")
 async def get_news_by_query(request: QueryRequest):
     """Get news data by processing a natural language query."""
     if not initialized or not mcp_session:
         raise HTTPException(status_code=503, detail="MCP servers not initialized")
-    
+
     try:
         # Process the news query through the MCP session
         response = await mcp_session.chat(request.query)
         return QueryResponse(response=response, success=True)
-        
+
     except Exception as e:
         logging.error(f"News query error: {e}")
         return QueryResponse(
-            response=f"❌ Error processing news query: {str(e)}",
-            success=False,
-            error=str(e)
+            response=f"❌ Error processing news query: {str(e)}", success=False, error=str(e)
         )
+
 
 # ------------------------------------------------------------------------------
 # Entrypoint (optional)
