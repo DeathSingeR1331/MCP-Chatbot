@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import shutil
-import sys
 from typing import Dict, List, Optional, Any
 from enum import Enum
 
@@ -14,6 +13,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 import base64  # For decoding base64 image data
 import subprocess
+
+# Gmail MCP Server integration (no custom imports needed)
 
 # LLM Provider imports with availability checking
 try:
@@ -33,15 +34,25 @@ except ImportError:
 
 # Ollama removed - only using Groq and Gemini
 
-from test_notion import (
-    test_comment_on_page,
-    test_search_pages,
-    test_list_databases,
-    test_retrieve_comments,
-    test_query_database,
-    test_retrieve_page,
-    test_get_page_blocks,
-)  # reuse working functions
+try:
+    from test_notion import (
+        test_comment_on_page,
+        test_search_pages,
+        test_list_databases,
+        test_retrieve_comments,
+        test_query_database,
+        test_retrieve_page,
+        test_get_page_blocks,
+    )  # reuse working functions
+except ImportError:
+    # test_notion module not available, define stub functions
+    def test_comment_on_page(*args, **kwargs): pass
+    def test_search_pages(*args, **kwargs): pass
+    def test_list_databases(*args, **kwargs): pass
+    def test_retrieve_comments(*args, **kwargs): pass
+    def test_query_database(*args, **kwargs): pass
+    def test_retrieve_page(*args, **kwargs): pass
+    def test_get_page_blocks(*args, **kwargs): pass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -64,6 +75,10 @@ class Configuration:
         self.notion_token = os.getenv("NOTION_TOKEN")
         self.weather_api_key = os.getenv("WEATHER_API_KEY", "44565af3b7bbec06cde35bd8512f44bb")
         self.news_api_key = os.getenv("NEWS_API_KEY", "6fb893accc5ac91dd59dac3c82bdaf52")
+        # Spotify credentials for automated playback.  If not provided, Spotify
+        # integration will be disabled and attempts to play songs will return failure.
+        self.spotify_email = os.getenv("SPOTIFY_EMAIL")
+        self.spotify_password = os.getenv("SPOTIFY_PASSWORD")
 
     @staticmethod
     def load_env() -> None:
@@ -324,32 +339,32 @@ class MultiLLMClient:
             if self.available_providers:
                 self.current_provider = self.available_providers[0]
                 target_provider = self.current_provider
-                logging.info(f"🎯 Auto-selected LLM provider: {target_provider.value}")
+                logging.info(f"Auto-selected LLM provider: {target_provider.value}")
             else:
-                return "❌ No LLM providers available. Set GROQ_API_KEY or GEMINI_API_KEY in your environment/.env."
+                return "ERROR: No LLM providers available. Set GROQ_API_KEY or GEMINI_API_KEY in your environment/.env."
         try:
             response = self._get_response_from_provider(messages, target_provider)
             if response:
-                logging.info(f"✓ Response from {target_provider.value}")
+                logging.info(f"Response from {target_provider.value}")
                 return response
         except Exception as e:
             error_msg = f"Provider {target_provider.value} error: {str(e)}"
             logging.error(error_msg)
             if self.fallback_mode:
-                logging.info("🔄 Fallback mode enabled, trying other providers...")
+                logging.info("Fallback mode enabled, trying other providers...")
                 for fallback_provider in self.available_providers:
                     if fallback_provider == target_provider:
                         continue
                     try:
                         response = self._get_response_from_provider(messages, fallback_provider)
                         if response:
-                            logging.info(f"✓ Fallback successful with {fallback_provider.value}")
+                            logging.info(f"Fallback successful with {fallback_provider.value}")
                             return response
                     except Exception as fallback_error:
-                        logging.warning(f"✗ Fallback provider {fallback_provider.value} also failed: {fallback_error}")
+                        logging.warning(f"Fallback provider {fallback_provider.value} also failed: {fallback_error}")
                         continue
-            return f"❌ {error_msg}"
-        return f"⚠️ Failed to get response from {target_provider.value}."
+            return f"ERROR: {error_msg}"
+        return f"WARNING: Failed to get response from {target_provider.value}."
 
     def _get_response_from_provider(self, messages: List[Dict[str, str]], provider: LLMProvider) -> str:
         if provider == LLMProvider.GEMINI:
@@ -506,88 +521,58 @@ class ChatSession:
     async def chat(self, user_message: str) -> str:
         try:
             lowered = user_message.lower()
+            # Detect explicit Spotify playback requests.  If the user mentions
+            # Spotify and "play", or requests to play a song on Spotify, we
+            # bypass the LLM and call our helper directly.  This has
+            # precedence over the generic YouTube handler below.
+            if ("spotify" in lowered and "play" in lowered) or " on spotify" in lowered:
+                song_query = self._extract_spotify_song_query(lowered)
+                if song_query:
+                    played = await self._play_spotify_song(song_query)
+                    return "Playing on Spotify." if played else "Failed to start playback on Spotify."
+
+            # Detect Gmail requests: send email, read emails, search emails, open gmail
+            if (("gmail" in lowered and "send" in lowered) or 
+                ("send email" in lowered) or 
+                ("email" in lowered and "send" in lowered) or
+                ("compose" in lowered and "email" in lowered) or
+                ("write email" in lowered) or
+                ("draft email" in lowered) or
+                (lowered.startswith("send ") and " to " in lowered and "@" in lowered)):
+                email_data = self._extract_gmail_data(lowered)
+                if email_data:
+                    return await self._handle_gmail_send_via_mcp(email_data)
+                else:
+                    # If we can't extract email data but it's clearly a send request, try browser automation
+                    return await self._handle_gmail_send_via_browser(lowered)
+            
+            if ("gmail" in lowered and "read" in lowered) or ("read emails" in lowered) or ("show emails" in lowered) or ("open gmail" in lowered) or ("gmail" in lowered and ("open" in lowered or "show" in lowered or "unread" in lowered)) or ("unread message" in lowered and "gmail" in lowered) or ("gmail" in lowered and "message" in lowered):
+                return await self._handle_gmail_read_via_mcp(lowered)
+            
+            if ("gmail" in lowered and "search" in lowered) or ("search emails" in lowered):
+                search_query = self._extract_gmail_search_query(lowered)
+                if search_query:
+                    return await self._handle_gmail_search_via_mcp(search_query)
+            
+            # Advanced Gmail commands
+            gmail_advanced_result = await self._handle_gmail_advanced_commands(lowered)
+            if gmail_advanced_result:
+                return gmail_advanced_result
+
+            # Detect YouTube playback requests: either mention YouTube and play, or start with "play "
             if ("youtube" in lowered and "play" in lowered) or lowered.startswith("play "):
                 song_query = self._extract_youtube_song_query(lowered)
                 if song_query:
-                    played = await self._play_youtube_song_with_retry(song_query)
-                    return "✅ Playing on YouTube." if played else "❌ Failed to start playback on YouTube after all attempts."
+                    played = await self._play_youtube_song(song_query)
+                    return "Playing on YouTube." if played else "Failed to start playback on YouTube."
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
-            #
-            # Build the system prompt that instructs the language model on how to choose and call tools.
-            #
-            # In earlier versions, the model would sometimes use general-purpose browser tools (like
-            # ``browser_evaluate``) to try and fetch information from web pages when asked for news
-            # headlines.  This led to confusing or incorrect outputs (e.g. returning a page title
-            # instead of actual news articles).  To remedy this, the system message explicitly
-            # instructs the model to ALWAYS use the dedicated ``get_news`` tool for any queries
-            # requesting news, headlines, or the latest updates.  It also discourages the use of
-            # browser tools for news-related queries.  These additional guidelines reduce the
-            # likelihood that the model will misuse browser tools for tasks better handled by the
-            # news API.
-            system_message = f"""
-You are a helpful assistant with access to these tools:
-
-{tools_description}
-
-CRITICAL: You MUST use the EXACT tool names listed above.  Common browser tools include:
-- browser_navigate (to navigate to a URL)
-- browser_click (to click on elements)
-- browser_take_screenshot (to take screenshots)
-- browser_close (to close the page)
-- browser_resize (to resize browser window)
-- browser_get_current_url (to get current URL)
-- browser_get_page_title (to get page title)
-
-WEATHER TOOL:
-- get_weather (to get current weather for any city)
-  Arguments: {{"city": "city_name"}} (e.g., "New York", "London", "Tokyo")
-
-NEWS TOOL:
-- get_news (to get latest news articles on any topic)
-  Arguments: {{"query": "search_query", "max_results": 10, "language": "en"}} (e.g., "technology", "politics", "sports")
-
-NEWS QUERIES:
-- If the user asks for news, headlines, latest updates, or anything similar, you MUST use
-  ``get_news``.  DO NOT use browser tools (like ``browser_evaluate`` or ``browser_navigate``) to
-  scrape news pages.  Always call ``get_news`` with an appropriate ``query`` argument to fetch
-  the latest articles.
-
-Choose the appropriate tool based on the user's question.  If no tool is needed, reply directly.
-
-IMPORTANT: When you need to use a tool, respond with the exact JSON object format below.  For
-multiple tools or multi-step tasks, provide multiple JSON objects, each on a separate line.
-Nothing else in the response:
-
-{{
-    "tool": "exact-tool-name-from-list-above",
-    "arguments": {{
-        "argument-name": "value"
-    }}
-}}
-
-SPECIAL INSTRUCTIONS FOR MUSIC/VIDEO PLAYBACK:
-- When a user asks to "play" a song/video, you MUST do TWO steps:
-  1. First: Use ``browser_navigate`` to go to YouTube search results.
-  2. Second: Use ``browser_click`` or evaluate JavaScript to click on the first video result.
-- For YouTube searches, use: https://www.youtube.com/results?search_query=SONG_NAME
-- After navigating, click on the first video link to actually play it.
-
-For screenshot tools (``browser_take_screenshot``, ``puppeteer_screenshot``, etc.), always use
-``images/`` as the prefix for the path (e.g. ``images/screenshot.png``) so the file is saved
-into the images folder.  Use boolean values for the ``fullPage`` parameter (true/false, not
-strings).
-
-For navigation, use ``browser_navigate`` with the "url" argument.
-
-After receiving a tool's response:
-1. Transform the raw data into a natural, conversational response.
-2. Keep responses concise but informative.
-3. Focus on the most relevant information.
-4. Use appropriate context from the user's question.
-5. Avoid simply repeating the raw data.
-
-Please use only the tools that are explicitly defined above with their EXACT names.
-"""
+            # Construct a system message that guides the language model on how to select and
+            # invoke tools.  The instructions below emphasise when to use specific tools and
+            # when to avoid using browser automation for information retrieval.  In particular,
+            # news and general knowledge queries are explicitly covered to prevent the model
+            # from falling back to generic browser evaluations (e.g. reading a page title)
+            # when a simpler or more appropriate method exists.
+            system_message = f"""You are a helpful assistant with access to these tools: \n\n{tools_description}\n\nIMPORTANT RULES:\n1. For NEWS queries (like "latest news", "headlines", "sports news", etc.), ALWAYS use the `get_news` tool with appropriate query parameters.\n2. For WEATHER queries, use the `get_weather` tool with the city name.\n3. For GMAIL queries (like "send email", "read emails", "search emails", "mark emails as read"), DO NOT use browser automation. The system will handle Gmail operations automatically through MCP Gmail tools.\n4. For general knowledge questions, answer directly using your knowledge.\n5. For web browsing tasks, use browser tools like `browser_navigate`, `browser_click`, etc.\n\nWhen you need to use a tool, respond with ONLY this JSON format (nothing else):\n{{\n    \"tool\": \"tool_name\",\n    \"arguments\": {{\n        \"param\": \"value\"\n    }}\n}}\n\nAfter tool execution, provide a natural, conversational response based on the results."""
             messages = [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
@@ -646,8 +631,8 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                     if not query:
                         results.append("Missing 'query' for play_youtube_song")
                     else:
-                        ok = await self._play_youtube_song_with_retry(query)
-                        results.append("YouTube playback started" if ok else "Failed to start YouTube playback after all attempts")
+                        ok = await self._play_via_local_playwright(query)
+                        results.append("YouTube playback started" if ok else "Failed to start YouTube playback")
                 except Exception as e:
                     results.append(f"Error starting YouTube playback: {e}")
                 tool_executed = True
@@ -661,7 +646,7 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                         temp = weather_data.get("main", {}).get("temp", "N/A")
                         description = weather_data.get("weather", [{}])[0].get("description", "N/A")
                         humidity = weather_data.get("main", {}).get("humidity", "N/A")
-                        result = f"Weather in {city}: {description}, Temperature: {temp}°C, Humidity: {humidity}%"
+                        result = f"Weather in {city}: {description}, Temperature: {temp}C, Humidity: {humidity}%"
                     results.append(f"Weather tool executed successfully: {result}")
                     tool_executed = True
                 except Exception as e:
@@ -704,7 +689,17 @@ Please use only the tools that are explicitly defined above with their EXACT nam
                                     progress = result['progress']
                                     total = result['total']
                                     logging.info(f"Progress: {progress}/{total} ({(progress/total)*100:.1f}%)")
-                                results.append(f"Tool {tool_name} executed successfully: {result}")
+                                # Format the result better for different tool types
+                                if tool_name == "browser_navigate":
+                                    results.append(f"Successfully navigated to: {arguments.get('url', 'unknown URL')}")
+                                elif tool_name == "browser_take_screenshot":
+                                    results.append(f"Screenshot saved successfully: {result}")
+                                elif tool_name == "browser_click":
+                                    results.append(f"Successfully clicked on element")
+                                elif tool_name == "browser_evaluate":
+                                    results.append(f"JavaScript executed successfully: {result}")
+                                else:
+                                    results.append(f"Tool {tool_name} executed successfully: {result}")
                                 tool_executed = True
                                 break
                             except Exception as e:
@@ -721,152 +716,28 @@ Please use only the tools that are explicitly defined above with their EXACT nam
         if results:
             combined_result = "\n".join(results)
             logging.info(f"All tool executions completed. Results: {combined_result}")
-            is_success = any("executed successfully" in r for r in results) and not any("Error" in r for r in results)
-            if is_success:
-                return "✅ Task completed successfully."
-            if any("Error" in r for r in results):
-                return "❌ Task failed during tool execution."
-            return "ℹ️ Tools executed."
+            
+            # Instead of returning generic messages, return the actual results
+            # This allows the LLM to process the tool results and provide a proper response
+            return combined_result
         return llm_response
 
     async def _play_via_local_playwright(self, query: str) -> bool:
-        """Enhanced local Playwright automation with better browser configuration."""
         try:
-            # Escape the query for safe use in the code string
-            escaped_query = query.replace('"', '\\"').replace("'", "\\'")
-            
-            code = f'''import asyncio
-from playwright.async_api import async_playwright
-
-VIDEO_QUERY = "{escaped_query}"
-
-async def main():
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(
-            headless=False, 
-            args=[
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-web-security",
-                "--disable-features=VizDisplayCompositor",
-                "--enable-automation",
-                "--no-sandbox",
-                "--disable-blink-features=AutomationControlled"
-            ]
-        )
-        ctx = await browser.new_context(
-            permissions=["microphone","camera"],
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        )
-        page = await ctx.new_page()
-        
-        # Navigate to search results
-        search_url = "https://www.youtube.com/results?search_query=" + VIDEO_QUERY.replace(" ", "+")
-        await page.goto(search_url)
-        await page.wait_for_timeout(3000)
-        
-        # Try multiple selectors for video selection
-        selectors = [
-            'ytd-video-renderer a#thumbnail',
-            'ytd-video-renderer a#video-title',
-            'ytd-video-renderer h3 a',
-            'a#video-title',
-            'a#thumbnail'
-        ]
-        
-        clicked = False
-        for selector in selectors:
-            try:
-                element = page.locator(selector).first
-                if element.count() > 0:
-                    await element.scroll_into_view_if_needed()
-                    await element.click()
-                    clicked = True
-                    break
-            except Exception as e:
-                print(f"Selector {{selector}} failed: {{e}}")
-                continue
-        
-        if not clicked:
-            print("No video found with any selector")
-            return
-        
-        # Wait for video page to load
-        await page.wait_for_selector("video", timeout=10000)
-        await page.wait_for_timeout(2000)
-        
-        # Try to start playback
-        try:
-            # Click play button if visible
-            play_button = page.locator('.ytp-play-button, .ytp-large-play-button')
-            if play_button.count() > 0:
-                await play_button.click()
-            
-            # Also try direct video play
-            await page.evaluate("""
-                () => {{
-                    const video = document.querySelector('video');
-                    if (video) {{
-                        video.muted = false;
-                        video.volume = 0.7;
-                        video.play().catch(e => {{
-                            console.log('Play failed, trying muted:', e);
-                            video.muted = true;
-                            video.play();
-                        }});
-                    }}
-                }}
-            """)
-            
-        except Exception as e:
-            print(f"Playback attempt failed: {{e}}")
-        
-        await page.wait_for_timeout(5000)
-        await browser.close()
-
-asyncio.run(main())
-'''
+            code = f'''import asyncio\nfrom playwright.async_api import async_playwright\nVIDEO_QUERY={query!r}\nasync def main():\n    async with async_playwright() as p:\n        browser = await p.chromium.launch(headless=False, args=["--autoplay-policy=no-user-gesture-required"])\n        ctx = await browser.new_context(permissions=["microphone","camera"])\n        page = await ctx.new_page()\n        await page.goto("https://www.youtube.com/results?search_query=" + VIDEO_QUERY.replace(" ", "+"))\n        first = page.locator('ytd-video-renderer a#thumbnail').first\n        await first.click()\n        await page.wait_for_selector("video")\n        try:\n            await page.get_by_role("button", name="Play").click(timeout=2000)\n        except Exception: pass\n        await page.wait_for_timeout(5000)\nasyncio.run(main())\n'''
             proc = subprocess.Popen([sys.executable, "-c", code])
             return proc is not None
         except Exception as e:
             logging.error(f"Local Playwright spawn failed: {e}")
             return False
 
-    async def _play_youtube_song_with_retry(self, query: str, max_retries: int = 3) -> bool:
-        """YouTube automation with retry mechanism and comprehensive logging."""
-        logging.info(f"🎵 Starting YouTube automation with retry for: {query}")
-        
-        for attempt in range(max_retries):
-            logging.info(f"🔄 Attempt {attempt + 1}/{max_retries}")
-            
-            try:
-                # Try the enhanced automation first
-                if await self._play_youtube_song(query):
-                    logging.info(f"✅ YouTube automation successful on attempt {attempt + 1}")
-                    return True
-                    
-                # If enhanced automation fails, try local Playwright as fallback
-                logging.info("🔄 Enhanced automation failed, trying local Playwright fallback...")
-                if await self._play_via_local_playwright(query):
-                    logging.info(f"✅ Local Playwright fallback successful on attempt {attempt + 1}")
-                    return True
-                    
-            except Exception as e:
-                logging.error(f"❌ Attempt {attempt + 1} failed: {e}")
-            
-            if attempt < max_retries - 1:
-                wait_time = (attempt + 1) * 2  # Progressive backoff: 2s, 4s, 6s
-                logging.info(f"⏳ Waiting {wait_time}s before retry...")
-                await asyncio.sleep(wait_time)
-        
-        logging.error(f"❌ All {max_retries} attempts failed for YouTube automation")
-        return False
-
     async def _play_youtube_song(self, query: str) -> bool:
-        """Enhanced YouTube playback automation with autoplay policy handling and comprehensive error handling."""
+        """Automate YouTube playback using available browser tools.
+
+        Strategy: navigate to results page, click first result, ensure video.play().
+        """
         try:
-            logging.info(f"🎵 Starting enhanced YouTube automation for: {query}")
             search_url = "https://www.youtube.com/results?search_query=" + urllib.parse.quote(query)
-            
             for server in self.servers:
                 if not server.session:
                     continue
@@ -875,390 +746,81 @@ asyncio.run(main())
                     tool_names = {t.name for t in tools}
                 except Exception:
                     continue
-                    
-                # Enhanced Playwright automation
+                # Prefer Playwright, fall back to Puppeteer
                 if {"browser_navigate", "browser_evaluate"}.issubset(tool_names):
-                    logging.info("🔍 Using Playwright for YouTube automation")
-                    
-                    # Step 1: Navigate with enhanced settings
-                    logging.info("🌐 Navigating to YouTube search results...")
                     await server.execute_tool("browser_navigate", {"url": search_url})
-                    
-                    # Step 2: Wait for search results to load with dynamic waiting
-                    logging.info("⏳ Waiting for search results to load...")
-                    await asyncio.sleep(3)
-                    
-                    # Step 3: Enhanced video selection with better selectors and user interaction simulation
-                    logging.info("🎯 Selecting first video with enhanced selectors...")
                     click_js = """
                     () => {
-                      // Wait for results to be visible
-                      const resultsContainer = document.querySelector('#contents, #primary, ytd-search');
-                      if (!resultsContainer) {
-                        console.log('Results container not found, waiting...');
-                        return false;
-                      }
-                      
-                      // Enhanced selectors for better compatibility
-                      const selectors = [
-                        'ytd-video-renderer a#video-title',
-                        'ytd-video-renderer a#thumbnail',
-                        'ytd-video-renderer h3 a',
-                        'ytd-video-renderer .ytd-thumbnail a',
-                        'ytd-video-renderer ytd-thumbnail a',
-                        'a#video-title',
-                        'a#thumbnail',
-                        'ytd-video-renderer #video-title-link',
-                        'ytd-video-renderer a[href*="/watch?v="]'
-                      ];
-                      
-                      for (const selector of selectors) {
-                        const link = document.querySelector(selector);
-                        if (link && link.href && link.href.includes('/watch?v=')) {
-                          console.log('Found video link with selector:', selector);
-                          // Simulate user interaction with scroll and click
-                          link.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                          
-                          // Create a proper click event
-                          const clickEvent = new MouseEvent('click', {
-                            bubbles: true,
-                            cancelable: true,
-                            view: window,
-                            button: 0
-                          });
-                          
-                          // Dispatch the event
-                          link.dispatchEvent(clickEvent);
-                          
-                          // Also try direct click as fallback
-                          setTimeout(() => {
-                            if (link.click) link.click();
-                          }, 100);
-                          
-                          return true;
-                        }
-                      }
-                      
-                      // Fallback: find any video link and simulate user interaction
-                      const allLinks = document.querySelectorAll('a[href*="/watch?v="]');
-                      if (allLinks.length > 0) {
-                        console.log('Using fallback link selection');
-                        const firstLink = allLinks[0];
-                        firstLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        
-                        const clickEvent = new MouseEvent('click', {
-                          bubbles: true,
-                          cancelable: true,
-                          view: window,
-                          button: 0
-                        });
-                        
-                        firstLink.dispatchEvent(clickEvent);
-                        setTimeout(() => {
-                          if (firstLink.click) firstLink.click();
-                        }, 100);
-                        
-                        return true;
-                      }
-                      
-                      console.log('No video links found');
+                      const link = document.querySelector('ytd-video-renderer a#video-title, ytd-video-renderer a#thumbnail');
+                      if (link && link.href) { window.location.href = link.href; return true; }
+                      if (link) { link.click(); return true; }
                       return false;
                     }
                     """
-                    
-                    result = await server.execute_tool("browser_evaluate", {"function": click_js})
-                    logging.info(f"🎯 Video selection result: {result}")
-                    
-                    if not result:
-                        logging.warning("❌ Failed to select video, trying next server...")
-                        continue
-                        
-                    # Step 4: Wait for video page to load
-                    logging.info("⏳ Waiting for video page to load...")
-                    await asyncio.sleep(4)
-                    
-                    # Step 5: Enhanced video player interaction with autoplay policy handling
-                    logging.info("▶️ Attempting to play video with enhanced interaction...")
-                    for attempt in range(15):  # Increased attempts
+                    # Always click via evaluate for reliability
+                    await server.execute_tool("browser_evaluate", {"function": click_js})
+                    # Wait a moment for navigation to the video page
+                    await asyncio.sleep(1.5)
+                    import asyncio as _asyncio
+                    for _ in range(12):
                         play_js = """
                         () => {
-                          // Check if we're on a video page
-                          const video = document.querySelector('video');
-                          if (!video) {
-                            console.log('Video element not found, attempt:', arguments[0] || 0);
-                            return false;
-                          }
-                          
-                          console.log('Video element found, attempting to play...');
-                          
-                          // Handle autoplay policy and user interaction
-                          const playButton = document.querySelector('.ytp-play-button, .ytp-large-play-button, .ytp-big-mode .ytp-play-button');
-                          if (playButton) {
-                            const ariaLabel = playButton.getAttribute('aria-label') || '';
-                            if (ariaLabel.includes('Play') || ariaLabel.includes('play')) {
-                              console.log('Clicking play button');
-                              
-                              // Simulate user interaction on play button
-                              const clickEvent = new MouseEvent('click', {
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                                button: 0
-                              });
-                              
-                              playButton.dispatchEvent(clickEvent);
-                              playButton.click();
-                              
-                              return true;
-                            }
-                          }
-                          
-                          // Try to play video directly with comprehensive user gesture simulation
+                          const btn = document.querySelector('.ytp-play-button');
+                          if (btn) { btn.click(); }
+                          const v = document.querySelector('video');
+                          if (!v) return false;
                           try {
-                            console.log('Attempting direct video play...');
-                            
-                            // Simulate user interaction on video element
-                            const videoClickEvent = new MouseEvent('click', {
-                              bubbles: true,
-                              cancelable: true,
-                              view: window,
-                              button: 0
-                            });
-                            
-                            video.dispatchEvent(videoClickEvent);
-                            
-                            // Set video properties for better autoplay
-                            video.muted = false;
-                            video.volume = 0.7;
-                            video.autoplay = true;
-                            
-                            // Create additional user gesture events
-                            const touchEvent = new TouchEvent('touchstart', {
-                              bubbles: true,
-                              cancelable: true,
-                              touches: [new Touch({
-                                identifier: 1,
-                                target: video,
-                                clientX: 100,
-                                clientY: 100
-                              })]
-                            });
-                            
-                            video.dispatchEvent(touchEvent);
-                            
-                            // Attempt to play with promise handling
-                            const playPromise = video.play();
-                            if (playPromise !== undefined) {
-                              playPromise.then(() => {
-                                console.log('✅ Video started playing successfully');
-                                return true;
-                              }).catch(error => {
-                                console.log('❌ Play failed:', error.message);
-                                
-                                // Try muted play as fallback
-                                video.muted = true;
-                                video.play().then(() => {
-                                  console.log('✅ Video started playing (muted)');
-                                  // Unmute after a short delay
-                                  setTimeout(() => {
-                                    video.muted = false;
-                                  }, 1000);
-                                }).catch(mutedError => {
-                                  console.log('❌ Muted play also failed:', mutedError.message);
-                                });
-                              });
-                            }
-                            
-                            // Check if video is playing
-                            const isPlaying = !video.paused && !video.ended && video.readyState > 2;
-                            console.log('Video state check:', {
-                              paused: video.paused,
-                              ended: video.ended,
-                              readyState: video.readyState,
-                              isPlaying: isPlaying,
-                              currentTime: video.currentTime,
-                              duration: video.duration
-                            });
-                            
-                            return isPlaying;
-                            
-                          } catch (error) {
-                            console.log('❌ Video play error:', error.message);
-                            return false;
-                          }
+                            v.muted = false;
+                            const p = v.play?.();
+                            if (p && typeof p.then === 'function') { /* ignore */ }
+                          } catch (e) {}
+                          return !v.paused;
                         }
                         """
-                        
                         result = await server.execute_tool("browser_evaluate", {"function": play_js})
-                        logging.info(f"▶️ Play attempt {attempt + 1}/15: {result}")
-                        
                         if result:
-                            # Verify video is actually playing with comprehensive check
-                            logging.info("🔍 Verifying video playback...")
-                            verify_js = """
-                            () => {
-                              const video = document.querySelector('video');
-                              if (!video) {
-                                console.log('❌ No video element for verification');
-                                return false;
-                              }
-                              
-                              // Comprehensive video state check
-                              const isPlaying = !video.paused && !video.ended && video.readyState > 2;
-                              const hasDuration = video.duration > 0;
-                              const hasCurrentTime = video.currentTime > 0;
-                              const isLoaded = video.readyState >= 3; // HAVE_FUTURE_DATA
-                              
-                              const videoState = {
-                                isPlaying,
-                                hasDuration,
-                                hasCurrentTime,
-                                isLoaded,
-                                currentTime: video.currentTime,
-                                duration: video.duration,
-                                readyState: video.readyState,
-                                paused: video.paused,
-                                ended: video.ended,
-                                muted: video.muted,
-                                volume: video.volume
-                              };
-                              
-                              console.log('📊 Video verification state:', videoState);
-                              
-                              // Video is considered successfully playing if:
-                              // 1. Not paused and not ended
-                              // 2. Has duration (loaded metadata)
-                              // 3. Has current time (actually playing)
-                              // 4. Ready state indicates data is available
-                              const success = isPlaying && hasDuration && hasCurrentTime && isLoaded;
-                              
-                              if (success) {
-                                console.log('✅ Video verification successful - video is playing!');
-                              } else {
-                                console.log('❌ Video verification failed - video not playing properly');
-                              }
-                              
-                              return success;
-                            }
-                            """
-                            
-                            await asyncio.sleep(2)  # Wait for video to start
-                            verification = await server.execute_tool("browser_evaluate", {"function": verify_js})
-                            
-                            if verification:
-                                logging.info("✅ Video successfully started playing and verified!")
-                                return True
-                            else:
-                                logging.warning("⚠️ Video started but verification failed, continuing attempts...")
-                        
-                        await asyncio.sleep(1)  # Wait between attempts
-                    
-                    logging.warning("❌ Failed to start video playback after all attempts")
+                            return True
+                        await _asyncio.sleep(0.75)
                     return False
-                    
-                # Enhanced Puppeteer automation
-                elif {"puppeteer_navigate", "puppeteer_evaluate"}.issubset(tool_names):
-                    logging.info("🔍 Using Puppeteer for YouTube automation")
-                    
-                    # Similar enhanced logic for Puppeteer
+                if {"puppeteer_navigate", "puppeteer_evaluate"}.issubset(tool_names):
                     await server.execute_tool("puppeteer_navigate", {"url": search_url})
-                    await asyncio.sleep(3)
-                    
-                    # Enhanced Puppeteer click logic
                     click_js = """
                     () => {
-                      const selectors = [
-                        'ytd-video-renderer a#video-title',
-                        'ytd-video-renderer a#thumbnail',
-                        'ytd-video-renderer h3 a',
-                        'a#video-title',
-                        'a#thumbnail'
-                      ];
-                      
-                      for (const selector of selectors) {
-                        const link = document.querySelector(selector);
-                        if (link && link.href && link.href.includes('/watch?v=')) {
-                          console.log('Puppeteer found link with selector:', selector);
-                          link.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                          link.click();
-                          return true;
-                        }
-                      }
-                      
-                      const allLinks = document.querySelectorAll('a[href*="/watch?v="]');
-                      if (allLinks.length > 0) {
-                        allLinks[0].click();
-                        return true;
-                      }
-                      
+                      const link = document.querySelector('ytd-video-renderer a#video-title, ytd-video-renderer a#thumbnail');
+                      if (link && link.href) { window.location.href = link.href; return true; }
+                      if (link) { link.click(); return true; }
                       return false;
                     }
                     """
-                    
-                    result = await server.execute_tool("puppeteer_evaluate", {"script": click_js})
-                    logging.info(f"🎯 Puppeteer video selection result: {result}")
-                    
-                    if result:
-                        await asyncio.sleep(4)
-                        
-                        # Enhanced Puppeteer play logic
-                        for attempt in range(15):
-                            play_js = """
-                            () => {
-                              const video = document.querySelector('video');
-                              if (!video) return false;
-                              
-                              const playButton = document.querySelector('.ytp-play-button');
-                              if (playButton) {
-                                playButton.click();
-                                return true;
-                              }
-                              
-                              try {
-                                video.muted = false;
-                                video.volume = 0.7;
-                                const playPromise = video.play();
-                                if (playPromise !== undefined) {
-                                  playPromise.catch(() => {
-                                    video.muted = true;
-                                    video.play();
-                                  });
-                                }
-                                return !video.paused;
-                              } catch (e) {
-                                return false;
-                              }
-                            }
-                            """
-                            
-                            result = await server.execute_tool("puppeteer_evaluate", {"script": play_js})
-                            if result:
-                                await asyncio.sleep(2)
-                                verify_js = """
-                                () => {
-                                  const video = document.querySelector('video');
-                                  if (!video) return false;
-                                  return !video.paused && !video.ended && video.readyState > 2 && video.currentTime > 0;
-                                }
-                                """
-                                verification = await server.execute_tool("puppeteer_evaluate", {"script": verify_js})
-                                if verification:
-                                    logging.info("✅ Puppeteer video successfully started playing!")
-                                    return True
-                            
-                            await asyncio.sleep(1)
-                    
-                    logging.warning("❌ Puppeteer failed to start video playback")
+                    # Always click via evaluate for reliability
+                    await server.execute_tool("puppeteer_evaluate", {"script": click_js})
+                    # Wait a moment for navigation to the video page
+                    await asyncio.sleep(1.5)
+                    import asyncio as _asyncio
+                    for _ in range(12):
+                        play_js = """
+                        () => {
+                          const btn = document.querySelector('.ytp-play-button');
+                          if (btn) { btn.click(); }
+                          const v = document.querySelector('video');
+                          if (!v) return false;
+                          try {
+                            v.muted = false;
+                            const p = v.play?.();
+                            if (p && typeof p.then === 'function') { /* ignore */ }
+                          } catch (e) {}
+                          return !v.paused;
+                        }
+                        """
+                        result = await server.execute_tool("puppeteer_evaluate", {"script": play_js})
+                        if result:
+                            return True
+                        await _asyncio.sleep(0.75)
                     return False
-                    
-            logging.error("❌ No suitable browser automation tools found")
             return False
-            
         except Exception as e:
-            logging.error(f"❌ YouTube playback automation failed: {e}")
-            import traceback
-            logging.error(f"Full error traceback: {traceback.format_exc()}")
-            return False
+            logging.error(f"YouTube playback automation failed: {e}")
+        return False
 
     def _extract_youtube_song_query(self, lowered: str) -> Optional[str]:
         import re
@@ -1273,50 +835,1100 @@ asyncio.run(main())
             return m3.group(1).strip()
         return None
 
+    def _extract_spotify_song_query(self, lowered: str) -> Optional[str]:
+        """Extract the song query for Spotify playback.
+
+        This helper looks for patterns like "play <song> on spotify" or
+        "play <song> from spotify" in the user's lowercased message.
+
+        Args:
+            lowered: The user message in lower case.
+
+        Returns:
+            The extracted song name, or None if no suitable pattern is found.
+        """
+        import re
+        # Play <song> on spotify
+        m = re.search(r"play\s+(.+?)\s+on\s+spotify", lowered)
+        if m and m.group(1).strip():
+            return m.group(1).strip()
+        # Play <song> from spotify
+        m2 = re.search(r"play\s+(.+?)\s+from\s+spotify", lowered)
+        if m2 and m2.group(1).strip():
+            return m2.group(1).strip()
+        # Fallback: if starts with play and mentions spotify anywhere
+        if lowered.startswith("play ") and "spotify" in lowered:
+            # Remove "play " and trailing "on spotify" or "from spotify" phrases
+            q = lowered
+            q = re.sub(r"^play\s+", "", q)
+            q = re.sub(r"\s+on\s+spotify.*", "", q)
+            q = re.sub(r"\s+from\s+spotify.*", "", q)
+            return q.strip()
+        return None
+
+    async def _play_spotify_song(self, query: str) -> bool:
+        """Automate Spotify playback via Playwright.
+
+        This method attempts to play the given song on Spotify using the helper
+        defined in the spotify_play module.  Credentials are sourced from
+        environment variables or the configuration, if available.  It returns
+        True on success and False on failure.
+
+        Args:
+            query: The song name to search for and play (e.g. "Romulo Romulo").
+
+        Returns:
+            bool: True if playback starts successfully, False otherwise.
+        """
+        # Lazy import to avoid requiring Playwright if Spotify is never used
+        try:
+            from .spotify_play import play_spotify_song  # type: ignore
+        except Exception:
+            try:
+                # Fallback for environments where package-relative import isn't available
+                from spotify_play import play_spotify_song  # type: ignore
+            except Exception:
+                logging.error("Spotify playback helper could not be imported")
+                return False
+        # Gather credentials from configuration or environment
+        email = os.getenv("SPOTIFY_EMAIL") or None
+        password = os.getenv("SPOTIFY_PASSWORD") or None
+        # Prefer credentials from configuration if present
+        try:
+            cfg_email = getattr(self.llm_client.config, "spotify_email", None)
+            cfg_password = getattr(self.llm_client.config, "spotify_password", None)
+            if cfg_email:
+                email = cfg_email
+            if cfg_password:
+                password = cfg_password
+        except Exception:
+            pass
+        # If credentials are missing, we cannot automate login/playback
+        if not email or not password:
+            logging.warning("Spotify credentials not provided; cannot play song on Spotify")
+            return False
+        try:
+            return await play_spotify_song(query, email, password)
+        except Exception as e:
+            logging.error(f"Error during Spotify playback: {e}")
+            return False
+
     # Removed duplicate _play_youtube_song definition to avoid infinite recursion
+
+    def _extract_gmail_data(self, lowered: str) -> Optional[Dict]:
+        """Extract email data from user message for Gmail automation.
+        
+        This helper looks for patterns like "send email to john@example.com about meeting"
+        or "send email to john@example.com subject: meeting body: hello" in the user's message.
+        
+        Args:
+            lowered: The user message in lower case.
+            
+        Returns:
+            Dict containing email data (to, subject, body) or None if no pattern found.
+        """
+        import re
+        
+        # Pattern: "send email to john@example.com about meeting"
+        pattern = r"send email to ([^\s]+) (?:about|saying|with message) (.+)"
+        match = re.search(pattern, lowered)
+        if match:
+            return {
+                "to": match.group(1),
+                "subject": "Email from Synapse",
+                "body": match.group(2)
+            }
+        
+        # Pattern: "send email to john@example.com subject: meeting body: hello"
+        pattern2 = r"send email to ([^\s]+) subject: ([^:]+) body: (.+)"
+        match2 = re.search(pattern2, lowered)
+        if match2:
+            return {
+                "to": match2.group(1),
+                "subject": match2.group(2),
+                "body": match2.group(3)
+            }
+        
+        # Pattern: "send email to john@example.com saying hello world"
+        pattern3 = r"send email to ([^\s]+) saying (.+)"
+        match3 = re.search(pattern3, lowered)
+        if match3:
+            return {
+                "to": match3.group(1),
+                "subject": "Email from Synapse",
+                "body": match3.group(2)
+            }
+        
+        # Pattern: "email john@example.com about meeting"
+        pattern4 = r"email ([^\s]+) (?:about|saying|with message) (.+)"
+        match4 = re.search(pattern4, lowered)
+        if match4:
+            return {
+                "to": match4.group(1),
+                "subject": "Email from Synapse",
+                "body": match4.group(2)
+            }
+        
+        # Pattern: "compose email to john@example.com about meeting"
+        pattern5 = r"compose email to ([^\s]+) (?:about|saying|with message) (.+)"
+        match5 = re.search(pattern5, lowered)
+        if match5:
+            return {
+                "to": match5.group(1),
+                "subject": "Email from Synapse",
+                "body": match5.group(2)
+            }
+        
+        # Pattern: "write email to john@example.com about meeting"
+        pattern6 = r"write email to ([^\s]+) (?:about|saying|with message) (.+)"
+        match6 = re.search(pattern6, lowered)
+        if match6:
+            return {
+                "to": match6.group(1),
+                "subject": "Email from Synapse",
+                "body": match6.group(2)
+            }
+        
+        # Pattern: "draft email to john@example.com about meeting"
+        pattern7 = r"draft email to ([^\s]+) (?:about|saying|with message) (.+)"
+        match7 = re.search(pattern7, lowered)
+        if match7:
+            return {
+                "to": match7.group(1),
+                "subject": "Email from Synapse",
+                "body": match7.group(2)
+            }
+        
+        # Pattern: "send hello to john@example.com" or "send message to john@example.com"
+        pattern8 = r"send ([^\s]+) to ([^\s]+)"
+        match8 = re.search(pattern8, lowered)
+        if match8:
+            return {
+                "to": match8.group(2),
+                "subject": "Email from Synapse",
+                "body": match8.group(1)
+            }
+        
+        # Pattern: "send hello world to john@example.com" (multi-word message)
+        pattern9 = r"send (.+?) to ([^\s]+)"
+        match9 = re.search(pattern9, lowered)
+        if match9:
+            return {
+                "to": match9.group(2),
+                "subject": "Email from Synapse",
+                "body": match9.group(1)
+            }
+        
+        return None
+
+    def _extract_gmail_search_query(self, lowered: str) -> Optional[str]:
+        """Extract search query from user message for Gmail search.
+        
+        This helper looks for patterns like "search emails for meeting" or
+        "search emails about project" in the user's message.
+        
+        Args:
+            lowered: The user message in lower case.
+            
+        Returns:
+            The extracted search query or None if no pattern found.
+        """
+        import re
+        
+        # Pattern: "search emails for meeting"
+        pattern = r"search emails (?:for|about) (.+)"
+        match = re.search(pattern, lowered)
+        if match:
+            return match.group(1)
+        
+        # Pattern: "search gmail for meeting"
+        pattern2 = r"search gmail (?:for|about) (.+)"
+        match2 = re.search(pattern2, lowered)
+        if match2:
+            return match2.group(1)
+        
+        return None
+
+    async def _handle_gmail_send_via_mcp(self, email_data: Dict) -> str:
+        """Handle Gmail send via MCP AutoAuth server."""
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            # Check for attachments
+            attachment_paths = self._extract_attachment_paths(email_data.get('body', ''))
+            
+            # Prepare email data for MCP tool
+            email_args = {
+                "to": [email_data['to']],
+                "subject": email_data['subject'],
+                "body": email_data['body'],
+                "mimeType": "text/plain"
+            }
+            
+            # Add attachments if found
+            if attachment_paths:
+                email_args["attachments"] = attachment_paths
+            
+            # Execute send_email tool
+            result = await gmail_server.execute_tool("send_email", email_args)
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                if "successfully" in text_content.lower():
+                    return f"📧 Email sent successfully! {text_content}"
+                else:
+                    return f"❌ Failed to send email: {text_content}"
+            else:
+                return "❌ Failed to send email: No response from Gmail server"
+                
+        except Exception as e:
+            logging.error(f"Gmail MCP send failed: {e}")
+            return f"❌ Gmail send failed: {str(e)}"
+
+    async def _handle_gmail_read_via_mcp(self, lowered: str) -> str:
+        """Handle Gmail read via MCP AutoAuth server."""
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            # Determine search query based on user request
+            if "unread" in lowered:
+                search_query = "is:unread"
+            elif "first unread" in lowered:
+                search_query = "is:unread"
+            else:
+                search_query = "in:inbox"
+            
+            # Use search_emails to get emails
+            search_args = {
+                "query": search_query,
+                "maxResults": 10
+            }
+            
+            result = await gmail_server.execute_tool("search_emails", search_args)
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                # Parse the email data from the text response
+                emails = self._parse_gmail_search_response(text_content)
+                
+                # Handle first unread message request
+                if "first unread" in lowered and emails:
+                    first_email = emails[0]
+                    sender = first_email.get("from", "Unknown")
+                    subject = first_email.get("subject", "No Subject")
+                    preview = first_email.get("snippet", "")
+                    
+                    response = f"📧 First Unread Message:\n\n"
+                    response += f"From: {sender}\n"
+                    response += f"Subject: {subject}\n"
+                    if preview:
+                        response += f"Preview: {preview}"
+                    
+                    return response
+                
+                # Format email list
+                email_list = []
+                for i, email in enumerate(emails[:5], 1):
+                    sender = email.get("from", "Unknown")
+                    subject = email.get("subject", "No Subject")
+                    date = email.get("date", "")
+                    
+                    email_text = f"{i}. From: {sender}\n   Subject: {subject}\n   Date: {date}"
+                    email_list.append(email_text)
+                
+                email_display = "\n\n".join(email_list)
+                total_count = len(emails)
+                
+                response = f"📧 Found {total_count} emails"
+                if "unread" in lowered:
+                    response += " (unread)"
+                response += f":\n\n{email_display}"
+                
+                return response
+            else:
+                if "unread" in lowered:
+                    return "📧 No unread messages found in your Gmail inbox."
+                else:
+                    return "📧 No emails found in your Gmail inbox."
+                
+        except Exception as e:
+            logging.error(f"Gmail MCP read failed: {e}")
+            return f"❌ Gmail read failed: {str(e)}"
+
+    async def _handle_gmail_search_via_mcp(self, query: str) -> str:
+        """Handle Gmail search via MCP AutoAuth server."""
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            search_args = {
+                "query": query,
+                "maxResults": 10
+            }
+            
+            result = await gmail_server.execute_tool("search_emails", search_args)
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                # Parse the email data from the text response
+                emails = self._parse_gmail_search_response(text_content)
+                
+                if emails:
+                    email_list = []
+                    for i, email in enumerate(emails, 1):
+                        sender = email.get("from", "Unknown")
+                        subject = email.get("subject", "No Subject")
+                        date = email.get("date", "")
+                        
+                        email_text = f"{i}. From: {sender}\n   Subject: {subject}\n   Date: {date}"
+                        email_list.append(email_text)
+                    
+                    email_display = "\n\n".join(email_list)
+                    return f"📧 Search results for '{query}':\n\n{email_display}"
+                else:
+                    return f"📧 No emails found matching '{query}'"
+            else:
+                return f"📧 No emails found matching '{query}'"
+                
+        except Exception as e:
+            logging.error(f"Gmail MCP search failed: {e}")
+            return f"❌ Gmail search failed: {str(e)}"
+
+    def _get_gmail_server(self):
+        """Get the Gmail MCP server."""
+        for server in self.servers:
+            if server.name == "gmail":
+                return server
+        return None
+
+    def _extract_attachment_paths(self, text: str) -> List[str]:
+        """Extract file paths from user message."""
+        import re
+        
+        # Look for file paths in the text
+        file_patterns = [
+            r'[A-Za-z]:\\[^\\s]+',  # Windows paths
+            r'/[^\\s]+',            # Unix paths
+            r'\./[^\\s]+',          # Relative paths
+        ]
+        
+        attachments = []
+        for pattern in file_patterns:
+            matches = re.findall(pattern, text)
+            attachments.extend(matches)
+        
+        # Filter for actual files (basic check)
+        valid_attachments = []
+        for path in attachments:
+            if os.path.exists(path) and os.path.isfile(path):
+                valid_attachments.append(path)
+        
+        return valid_attachments
+
+    def _parse_gmail_search_response(self, text_content: str) -> List[Dict]:
+        """Parse Gmail search response text into email objects."""
+        emails = []
+        
+        # Split by double newlines to get individual emails
+        email_blocks = text_content.strip().split('\n\n')
+        
+        for block in email_blocks:
+            if not block.strip():
+                    continue
+                    
+            lines = block.strip().split('\n')
+            email_data = {}
+            
+            for line in lines:
+                if line.startswith('ID: '):
+                    email_data['id'] = line[4:].strip()
+                elif line.startswith('Subject: '):
+                    email_data['subject'] = line[9:].strip()
+                elif line.startswith('From: '):
+                    email_data['from'] = line[6:].strip()
+                elif line.startswith('Date: '):
+                    email_data['date'] = line[6:].strip()
+            
+            if email_data:  # Only add if we have some data
+                emails.append(email_data)
+        
+        return emails
+
+    async def _handle_gmail_advanced_commands(self, lowered: str) -> str:
+        """Handle advanced Gmail commands via MCP."""
+        
+        # Draft email
+        if "draft" in lowered and "email" in lowered:
+            return await self._handle_gmail_draft_via_mcp(lowered)
+        
+        # List labels
+        if "list labels" in lowered or "show labels" in lowered:
+            return await self._handle_gmail_labels_via_mcp()
+        
+        # Create label
+        if "create label" in lowered:
+            return await self._handle_gmail_create_label_via_mcp(lowered)
+        
+        # Delete email
+        if "delete email" in lowered:
+            return await self._handle_gmail_delete_via_mcp(lowered)
+        
+        # Mark as read/unread
+        if "mark as read" in lowered or "mark as unread" in lowered:
+            return await self._handle_gmail_mark_via_mcp(lowered)
+        
+        # List filters
+        if "list filters" in lowered or "show filters" in lowered:
+            return await self._handle_gmail_list_filters_via_mcp()
+        
+        # Create filter
+        if "create filter" in lowered:
+            return await self._handle_gmail_create_filter_via_mcp(lowered)
+        
+        return None
+
+    async def _handle_gmail_draft_via_mcp(self, lowered: str) -> str:
+        """Create email draft via MCP."""
+        email_data = self._extract_gmail_data(lowered)
+        if not email_data:
+            return "❌ Could not extract email data for draft"
+        
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            draft_args = {
+                "to": [email_data['to']],
+                "subject": email_data['subject'],
+                "body": email_data['body']
+            }
+            
+            result = await gmail_server.execute_tool("draft_email", draft_args)
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                if "successfully" in text_content.lower():
+                    return f"📝 Email draft created successfully! {text_content}"
+                else:
+                    return f"❌ Failed to create draft: {text_content}"
+            else:
+                return "❌ Failed to create draft: No response from Gmail server"
+                
+        except Exception as e:
+            return f"❌ Draft creation failed: {str(e)}"
+
+    async def _handle_gmail_labels_via_mcp(self) -> str:
+        """List Gmail labels via MCP."""
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            result = await gmail_server.execute_tool("list_email_labels", {})
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                return f"📋 Gmail Labels:\n\n{text_content}"
+            else:
+                return "📋 No labels found"
+                
+        except Exception as e:
+            return f"❌ Failed to list labels: {str(e)}"
+
+    async def _handle_gmail_create_label_via_mcp(self, lowered: str) -> str:
+        """Create Gmail label via MCP."""
+        # Extract label name from user message
+        import re
+        match = re.search(r'create label[:\s]+([^\s]+)', lowered)
+        if not match:
+            return "❌ Please specify label name. Example: 'create label Work'"
+        
+        label_name = match.group(1)
+        
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            label_args = {
+                "name": label_name,
+                "messageListVisibility": "show",
+                "labelListVisibility": "labelShow"
+            }
+            
+            result = await gmail_server.execute_tool("create_label", label_args)
+            
+            if result and result.content:
+                # Extract text content from MCP response
+                text_content = ""
+                for content_item in result.content:
+                    if hasattr(content_item, 'text'):
+                        text_content += content_item.text
+                
+                if "successfully" in text_content.lower():
+                    return f"🏷️ Label '{label_name}' created successfully! {text_content}"
+                else:
+                    return f"❌ Failed to create label: {text_content}"
+            else:
+                return "❌ Failed to create label: No response from Gmail server"
+                
+        except Exception as e:
+            return f"❌ Label creation failed: {str(e)}"
+
+    async def _handle_gmail_delete_via_mcp(self, lowered: str) -> str:
+        """Delete Gmail email via MCP."""
+        # Extract message ID from user message
+        import re
+        match = re.search(r'delete email[:\s]+([^\s]+)', lowered)
+        if not match:
+            return "❌ Please specify message ID. Example: 'delete email 182ab45cd67ef'"
+        
+        message_id = match.group(1)
+        
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            delete_args = {
+                "messageId": message_id
+            }
+            
+            result = await gmail_server.execute_tool("delete_email", delete_args)
+            
+            if result and result.get("success"):
+                return f"🗑️ Email {message_id} deleted successfully!"
+            else:
+                return f"❌ Failed to delete email: {result.get('error', 'Unknown error')}"
+                
+        except Exception as e:
+            return f"❌ Email deletion failed: {str(e)}"
+
+    async def _handle_gmail_mark_via_mcp(self, lowered: str) -> str:
+        """Mark Gmail emails as read/unread via MCP."""
+        # Extract message ID from user message
+        import re
+        match = re.search(r'mark.*?([^\s]+).*?(?:as read|as unread)', lowered)
+        if not match:
+            return "❌ Please specify message ID. Example: 'mark email 182ab45cd67ef as read'"
+        
+        message_id = match.group(1)
+        is_read = "as read" in lowered
+        
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            modify_args = {
+                "messageId": message_id,
+                "addLabelIds": [] if is_read else ["UNREAD"],
+                "removeLabelIds": ["UNREAD"] if is_read else []
+            }
+            
+            result = await gmail_server.execute_tool("modify_email", modify_args)
+            
+            if result and result.get("success"):
+                status = "read" if is_read else "unread"
+                return f"✅ Email {message_id} marked as {status}!"
+            else:
+                return f"❌ Failed to mark email: {result.get('error', 'Unknown error')}"
+                    
+        except Exception as e:
+            return f"❌ Email marking failed: {str(e)}"
+
+    async def _handle_gmail_list_filters_via_mcp(self) -> str:
+        """List Gmail filters via MCP."""
+        try:
+            gmail_server = self._get_gmail_server()
+            if not gmail_server:
+                return "❌ Gmail MCP server not available"
+            
+            result = await gmail_server.execute_tool("list_filters", {})
+            
+            if result and result.get("filters"):
+                filters = result["filters"]
+                filter_list = []
+                
+                for filter_item in filters:
+                    filter_id = filter_item.get("id", "Unknown")
+                    criteria = filter_item.get("criteria", {})
+                    action = filter_item.get("action", {})
+                    
+                    criteria_text = ", ".join([f"{k}: {v}" for k, v in criteria.items()])
+                    action_text = ", ".join([f"{k}: {v}" for k, v in action.items()])
+                    
+                    filter_list.append(f"• ID: {filter_id}\n  Criteria: {criteria_text}\n  Action: {action_text}")
+                
+                filter_display = "\n\n".join(filter_list)
+                return f"🔍 Gmail Filters:\n\n{filter_display}"
+            else:
+                return "🔍 No filters found"
+                
+        except Exception as e:
+            return f"❌ Failed to list filters: {str(e)}"
+
+    async def _handle_gmail_create_filter_via_mcp(self, lowered: str) -> str:
+        """Create Gmail filter via MCP."""
+        # This is a simplified version - in practice, you'd want more sophisticated parsing
+        return "❌ Filter creation requires specific parameters. Please use the Gmail interface for complex filters."
+
+    async def _handle_gmail_send_via_browser(self, lowered: str) -> str:
+        """Handle Gmail send via browser automation as fallback."""
+        try:
+            # Extract email data from the message
+            email_data = self._extract_gmail_data(lowered)
+            if not email_data:
+                return "❌ Could not extract email data. Please specify recipient, subject, and body clearly."
+            
+            # Find a browser automation server
+            browser_server = None
+            for server in self.servers:
+                if not server.session:
+                    continue
+                try:
+                    tools = await server.list_tools()
+                    tool_names = {t.name for t in tools}
+                    if {"browser_navigate", "browser_evaluate", "browser_click", "browser_type"}.issubset(tool_names):
+                        browser_server = server
+                        break
+                except Exception:
+                    continue
+            
+            if not browser_server:
+                return "❌ No browser automation server available for Gmail sending."
+            
+            # Navigate to Gmail
+            await browser_server.execute_tool("browser_navigate", {"url": "https://mail.google.com"})
+            await asyncio.sleep(3)
+            
+            # Click Compose button
+            compose_js = """
+            () => {
+                const composeButton = document.querySelector('[role="button"][aria-label*="Compose"], [role="button"][aria-label*="compose"], .T-I.T-I-KE.L3');
+                if (composeButton) {
+                    composeButton.click();
+                    return true;
+                }
+                return false;
+            }
+            """
+            await browser_server.execute_tool("browser_evaluate", {"function": compose_js})
+            await asyncio.sleep(2)
+            
+            # Fill recipient field - Updated selectors based on actual Gmail structure
+            recipient_js = f"""
+            () => {{
+                // Try multiple selectors for the recipient field
+                const selectors = [
+                    'input[aria-label*="To"]',
+                    'input[placeholder*="To"]', 
+                    '.vR input',
+                    'input[aria-label="To recipients"]',
+                    'input[aria-label="To"]',
+                    'div[aria-label*="To"] input',
+                    'div[role="combobox"] input',
+                    'input[type="text"]'
+                ];
+                
+                let toField = null;
+                for (const selector of selectors) {{
+                    toField = document.querySelector(selector);
+                    if (toField && toField.offsetParent !== null) {{ // Check if visible
+                        break;
+                    }}
+                }}
+                
+                if (toField) {{
+                    toField.focus();
+                    toField.click();
+                    toField.value = "{email_data['to']}";
+                    
+                    // Trigger events to make Gmail recognize the input
+                    toField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    toField.dispatchEvent(new Event('change', {{ bubbles: true }}));
+                    toField.dispatchEvent(new Event('blur', {{ bubbles: true }}));
+                    
+                    // Try pressing Enter to confirm the recipient
+                    toField.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true }}));
+                    
+                    return true;
+                }}
+                return false;
+            }}
+            """
+            recipient_result = await browser_server.execute_tool("browser_evaluate", {"function": recipient_js})
+            logging.info(f"Recipient field fill result: {recipient_result}")
+            await asyncio.sleep(2)
+            
+            # Fill subject field
+            subject_js = f"""
+            () => {{
+                const subjectField = document.querySelector('input[aria-label*="Subject"], input[placeholder*="Subject"], .aoT input');
+                if (subjectField) {{
+                    subjectField.focus();
+                    subjectField.value = "{email_data['subject']}";
+                    subjectField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    return true;
+                }}
+                return false;
+            }}
+            """
+            await browser_server.execute_tool("browser_evaluate", {"function": subject_js})
+            await asyncio.sleep(1)
+            
+            # Fill body field
+            body_js = f"""
+            () => {{
+                const bodyField = document.querySelector('div[aria-label*="Message Body"], div[contenteditable="true"], .Am.Al.editable');
+                if (bodyField) {{
+                    bodyField.focus();
+                    bodyField.innerHTML = "{email_data['body'].replace('"', '\\"')}";
+                    bodyField.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                    return true;
+                }}
+                return false;
+            }}
+            """
+            await browser_server.execute_tool("browser_evaluate", {"function": body_js})
+            await asyncio.sleep(2)
+            
+            # Click Send button - Updated selectors based on actual Gmail structure
+            send_js = """
+            () => {
+                // Try multiple selectors for the send button
+                const selectors = [
+                    'button[aria-label*="Send"]',
+                    'button[aria-label*="send"]',
+                    'div[role="button"][aria-label*="Send"]',
+                    'div[role="button"][aria-label*="send"]',
+                    '.T-I.J-J5-Ji.aoO.T-I-atl.L3',
+                    'button:contains("Send")',
+                    'div[role="button"]:contains("Send")',
+                    'button[data-tooltip*="Send"]',
+                    'div[data-tooltip*="Send"]'
+                ];
+                
+                let sendButton = null;
+                for (const selector of selectors) {
+                    sendButton = document.querySelector(selector);
+                    if (sendButton && sendButton.offsetParent !== null) { // Check if visible
+                        break;
+                    }
+                }
+                
+                // If no button found with selectors, try to find by text content
+                if (!sendButton) {
+                    const buttons = document.querySelectorAll('button, div[role="button"]');
+                    for (const button of buttons) {
+                        if (button.textContent && button.textContent.toLowerCase().includes('send')) {
+                            sendButton = button;
+                            break;
+                        }
+                    }
+                }
+                
+                if (sendButton) {
+                    sendButton.click();
+                    return true;
+                }
+                return false;
+            }
+            """
+            send_result = await browser_server.execute_tool("browser_evaluate", {"function": send_js})
+            logging.info(f"Send button click result: {send_result}")
+            await asyncio.sleep(3)
+            
+            return f"📧 Email sent successfully via browser automation to {email_data['to']}!"
+            
+        except Exception as e:
+            logging.error(f"Gmail browser automation failed: {e}")
+            return f"❌ Gmail send failed via browser automation: {str(e)}"
+
+    async def _search_gmail_via_browser_old(self, query: str) -> List[Dict]:
+        """Search emails via Gmail.com browser automation - SAME PATTERN AS YOUTUBE.
+        
+        This method automates Gmail email searching using the same browser automation
+        pattern as YouTube. It navigates to Gmail, performs search, and extracts results.
+        
+        Args:
+            query: Search query string.
+            
+        Returns:
+            List of email dictionaries matching the search query.
+        """
+        try:
+            for server in self.servers:
+                if not server.session:
+                    continue
+                try:
+                    tools = await server.list_tools()
+                    tool_names = {t.name for t in tools}
+                except Exception:
+                    continue
+                    
+                if {"browser_navigate", "browser_evaluate"}.issubset(tool_names):
+                    # Navigate to Gmail
+                    await server.execute_tool("browser_navigate", {"url": "https://mail.google.com"})
+                    await asyncio.sleep(3)
+                    
+                    # Click search box
+                    search_js = """
+                    () => {
+                        const searchBox = document.querySelector('input[aria-label="Search mail"]');
+                        if (searchBox) {
+                            searchBox.click();
+                            searchBox.focus();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """
+                    await server.execute_tool("browser_evaluate", {"function": search_js})
+                    await asyncio.sleep(1)
+                    
+                    # Type search query
+                    type_search_js = f"""
+                    () => {{
+                        const searchBox = document.querySelector('input[aria-label="Search mail"]');
+                        if (searchBox) {{
+                            searchBox.value = "{query}";
+                            searchBox.dispatchEvent(new Event('input', {{ bubbles: true }}));
+                            searchBox.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter' }}));
+                            return true;
+                        }}
+                        return false;
+                    }}
+                    """
+                    await server.execute_tool("browser_evaluate", {"function": type_search_js})
+                    await asyncio.sleep(3)
+                    
+                    # Extract search results using the same improved extraction
+                    read_emails_js = """
+                    () => {
+                        const emails = [];
+                        
+                        // Try multiple selectors for Gmail email rows
+                        const selectors = [
+                            'tr[role="row"]',
+                            'div[role="main"] tr',
+                            '.zA',
+                            '[data-legacy-thread-id]',
+                            'tr[jscontroller]'
+                        ];
+                        
+                        let emailElements = [];
+                        for (const selector of selectors) {
+                            emailElements = document.querySelectorAll(selector);
+                            if (emailElements.length > 0) break;
+                        }
+                        
+                        for (let i = 0; i < Math.min(emailElements.length, 10); i++) {
+                            const email = emailElements[i];
+                            
+                            // Try multiple selectors for sender
+                            let sender = 'Unknown';
+                            const senderSelectors = [
+                                'span[email]',
+                                '.yW span[email]',
+                                '.yW span',
+                                '[data-hovercard-id]',
+                                'span[title]'
+                            ];
+                            
+                            for (const sel of senderSelectors) {
+                                const senderEl = email.querySelector(sel);
+                                if (senderEl) {
+                                    sender = senderEl.getAttribute('email') || senderEl.textContent || senderEl.getAttribute('title') || 'Unknown';
+                                    if (sender && sender !== 'Unknown') break;
+                                }
+                            }
+                            
+                            // Try multiple selectors for subject
+                            let subject = 'No Subject';
+                            const subjectSelectors = [
+                                '.y6 span[title]',
+                                '.y6 span',
+                                'span[title]',
+                                '.bog',
+                                '[data-legacy-thread-id] span'
+                            ];
+                            
+                            for (const sel of subjectSelectors) {
+                                const subjectEl = email.querySelector(sel);
+                                if (subjectEl) {
+                                    subject = subjectEl.textContent || subjectEl.getAttribute('title') || 'No Subject';
+                                    if (subject && subject !== 'No Subject') break;
+                                }
+                            }
+                            
+                            // Try multiple selectors for preview
+                            let preview = '';
+                            const previewSelectors = [
+                                '.y2',
+                                '.yP',
+                                '.y2 span',
+                                '.yP span'
+                            ];
+                            
+                            for (const sel of previewSelectors) {
+                                const previewEl = email.querySelector(sel);
+                                if (previewEl) {
+                                    preview = previewEl.textContent || '';
+                                    if (preview) break;
+                                }
+                            }
+                            
+                            emails.push({
+                                sender: sender.trim(),
+                                subject: subject.trim(),
+                                preview: preview.trim()
+                            });
+                        }
+                        
+                        return emails;
+                    }
+                    """
+                    
+                    result = await server.execute_tool("browser_evaluate", {"function": read_emails_js})
+                    return result if result else []
+                    
+        except Exception as e:
+            logging.error(f"Gmail search automation failed: {e}")
+            return []
+
+    async def _mark_gmail_read_via_browser(self) -> bool:
+        """Mark emails as read via Gmail.com browser automation - SAME PATTERN AS YOUTUBE.
+        
+        This method automates marking Gmail emails as read using the same browser
+        automation pattern as YouTube. It navigates to Gmail and marks all visible
+        emails as read.
+        
+        Returns:
+            True if emails were marked as read successfully, False otherwise.
+        """
+        try:
+            for server in self.servers:
+                if not server.session:
+                    continue
+                try:
+                    tools = await server.list_tools()
+                    tool_names = {t.name for t in tools}
+                except Exception:
+                    continue
+                    
+                if {"browser_navigate", "browser_evaluate"}.issubset(tool_names):
+                    # Navigate to Gmail
+                    await server.execute_tool("browser_navigate", {"url": "https://mail.google.com"})
+                    await asyncio.sleep(3)
+                    
+                    # Select all emails
+                    select_all_js = """
+                    () => {
+                        const selectAllBtn = document.querySelector('input[type="checkbox"][aria-label="Select all"]');
+                        if (selectAllBtn) {
+                            selectAllBtn.click();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """
+                    await server.execute_tool("browser_evaluate", {"function": select_all_js})
+                    await asyncio.sleep(1)
+                    
+                    # Mark as read
+                    mark_read_js = """
+                    () => {
+                        const markReadBtn = document.querySelector('[aria-label*="Mark as read"]');
+                        if (markReadBtn) {
+                            markReadBtn.click();
+                            return true;
+                        }
+                        return false;
+                    }
+                    """
+                    result = await server.execute_tool("browser_evaluate", {"function": mark_read_js})
+                    await asyncio.sleep(2)
+                    
+                    return result
+                    
+        except Exception as e:
+            logging.error(f"Gmail mark as read automation failed: {e}")
+            return False
 
     async def start(self) -> None:
         try:
             print("\n" + "="*70)
-            print("🚀 Starting Multi-LLM Chat Assistant...")
+            print("Starting Multi-LLM Chat Assistant...")
             print("="*70)
-            print("\n🔌 Initializing MCP servers...")
+            print("\nInitializing MCP servers...")
             initialized_servers = 0
             for server in self.servers:
                 try:
                     await server.initialize()
                     initialized_servers += 1
-                    print(f"  ✓ Server '{server.name}' initialized")
+                    print(f"  + Server '{server.name}' initialized")
                 except Exception as e:
-                    logging.error(f"  ✗ Failed to initialize server '{server.name}': {e}")
+                    logging.error(f"  - Failed to initialize server '{server.name}': {e}")
             if initialized_servers == 0:
-                print("\n⚠  No MCP servers were initialized. Continuing without tools...")
-            print("\n🔧 Loading tools...")
+                print("\nWARNING: No MCP servers were initialized. Continuing without tools...")
+            print("\nLoading tools...")
             self.all_tools = []
             for server in self.servers:
                 if server.session:
                     try:
                         tools = await server.list_tools()
                         self.all_tools.extend(tools)
-                        print(f"  ✓ Loaded {len(tools)} tools from '{server.name}'")
+                        print(f"  + Loaded {len(tools)} tools from '{server.name}'")
                     except Exception as e:
-                        logging.warning(f"  ✗ Could not load tools from '{server.name}': {e}")
+                        logging.warning(f"  - Could not load tools from '{server.name}': {e}")
             self.tools_loaded = len(self.all_tools) > 0
-            print(f"\n📦 Total tools available: {len(self.all_tools)}")
-            print(f"\n🔍 Available tools from each server:")
+            print(f"\nTotal tools available: {len(self.all_tools)}")
+            print(f"\nAvailable tools from each server:")
             for server in self.servers:
                 if server.session:
                     try:
                         tools = await server.list_tools()
                         tool_names = [tool.name for tool in tools]
-                        print(f"  📦 {server.name}: {tool_names}")
+                        print(f"  {server.name}: {tool_names}")
                     except Exception as e:
-                        print(f"  ❌ {server.name}: Error listing tools - {e}")
-            print("\n🤖 SELECT YOUR LLM PROVIDER:")
+                        print(f"  ERROR {server.name}: Error listing tools - {e}")
+            print("\nSELECT YOUR LLM PROVIDER:")
             print("="*70)
             available_providers = self.llm_client.list_available_providers()
             if not available_providers:
-                print("❌ No LLM providers available! Please check your API keys and installations.")
+                print("ERROR: No LLM providers available! Please check your API keys and installations.")
                 return
             for idx, provider in enumerate(available_providers, 1):
                 provider_display = {
@@ -1329,52 +1941,47 @@ asyncio.run(main())
             print("="*70)
             while True:
                 try:
-                    choice = input(f"\n👉 Enter your choice (1-{len(available_providers)}): ").strip()
+                    choice = input(f"\nEnter your choice (1-{len(available_providers)}): ").strip()
                     choice_idx = int(choice) - 1
                     if 0 <= choice_idx < len(available_providers):
                         selected_provider = available_providers[choice_idx]
                         if self.llm_client.switch_provider(selected_provider):
-                            print(f"\n✅ Selected: {selected_provider}")
+                            print(f"\nSelected: {selected_provider}")
                             current_provider = self.llm_client.current_provider
-                            print(f"🎯 Current provider: {current_provider.value if current_provider else 'None'}")
+                            print(f"Current provider: {current_provider.value if current_provider else 'None'}")
                             break
                         else:
-                            print("❌ Failed to switch provider. Please try again.")
+                            print("Failed to switch provider. Please try again.")
                     else:
-                        print(f"❌ Invalid choice. Please enter a number between 1 and {len(available_providers)}.")
+                        print(f"Invalid choice. Please enter a number between 1 and {len(available_providers)}.")
                 except ValueError:
-                    print("❌ Invalid input. Please enter a number.")
+                    print("Invalid input. Please enter a number.")
                 except KeyboardInterrupt:
-                    print("\n\n👋 Exiting...")
+                    print("\n\nExiting...")
                     return
-            print("\n💡 Type /help for commands or start chatting!")
+            print("\nType /help for commands or start chatting!")
             print("="*70)
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
-            #
-            # Construct the system message for the interactive chat loop.  In addition to the core
-            # instructions, we explicitly document the ``get_news`` tool and clarify that it must be
-            # used for all news-related questions.  This prevents the LLM from misusing browser
-            # tools when the user is asking for headlines or latest updates.
+            # Construct a concise system message for the interactive CLI.  This message
+            # instructs the model how to choose tools and includes specific guidance for
+            # handling news and general knowledge queries without resorting to browser
+            # automation.  It retains the instructions on formatting tool calls and
+            # handling screenshot tools.
             system_message = (
-                "You are a helpful assistant with access to these tools: \n\n"
-                f"{tools_description}\n"
-                "Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.\n\n"
+                f"You are a helpful assistant with access to these tools: \n\n{tools_description}\n\n"
                 "NEWS QUERIES:\n"
-                "- If the user asks for news, headlines, latest updates, sports news, or anything similar, you MUST use\n"
-                "  the `get_news` tool described below. DO NOT use browser tools (like `browser_evaluate` or\n"
-                "  `browser_navigate`) to scrape web pages for news. Always call `get_news` with an appropriate\n"
-                "  `query` argument to fetch the latest articles.\n\n"
-                "IMPORTANT: When you need to use a tool, respond with the exact JSON object format below. For multiple\n"
-                "tools or multi-step tasks, provide multiple JSON objects, each on a separate line. Nothing else in the response:\n\n"
+                "- If the user asks for news, headlines, latest updates, sports news, or anything similar, you MUST use the `get_news` tool. DO NOT use browser tools (like `browser_evaluate` or `browser_navigate`) to scrape web pages for news or headlines.\n\n"
+                "GENERAL QUERIES:\n"
+                "- If the user asks a general question (e.g., `Who is the captain of the new ODI World Cup?`, `What is the capital of France?`, definitions, biographies, etc.), answer directly using your knowledge and reasoning. Do not use browser tools to scrape web pages for such questions.\n\n"
+                "Choose the appropriate tool based on the user's question. If no tool is needed, reply directly.\n\n"
+                "IMPORTANT: When you need to use a tool, respond with the exact JSON object format below. For multiple tools or multi-step tasks, provide multiple JSON objects, each on a separate line. Nothing else in the response:\n\n"
                 "{\n"
                 "    \"tool\": \"tool-name\",\n"
                 "    \"arguments\": {\n"
                 "        \"argument-name\": \"value\"\n"
                 "    }\n"
                 "}\n\n"
-                "For screenshot tools (browser_take_screenshot, puppeteer_screenshot, etc.), always use a path\n"
-                "starting with 'images/' (e.g., 'images/screenshot.png') to save in the images folder. Use boolean\n"
-                "values for fullPage parameter (true/false, not \"true\"/\"false\").\n\n"
+                "For screenshot tools (browser_take_screenshot, puppeteer_screenshot, etc.), always use a path starting with 'images/' (e.g., 'images/screenshot.png') to save in the images folder. Use boolean values for fullPage parameter (true/false, not \"true\"/\"false\").\n\n"
                 "After receiving a tool's response:\n"
                 "1. Transform the raw data into a natural, conversational response\n"
                 "2. Keep responses concise but informative\n"

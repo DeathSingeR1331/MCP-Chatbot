@@ -8,3 +8,11 @@ groq>=0.4.0
 playwright>=1.46.0
 apscheduler>=3.10.0
 tzlocal>=4.0
+
+
+# Gmail integration
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.99.0
+
+

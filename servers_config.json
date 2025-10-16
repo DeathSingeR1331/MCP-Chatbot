@@ -26,6 +26,12 @@
         "env": {
             "NOTION_TOKEN": "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"
         }
+      },
+      "gmail": {
+        "command": "npx",
+        "args": [
+            "@gongrzhe/server-gmail-autoauth-mcp"
+        ]
       }
     }
 }
