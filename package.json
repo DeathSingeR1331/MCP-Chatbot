@@ -1,8 +1,33 @@
 {
-  "type": "module",
+  "name": "synapse-ai-chatbot-frontend",
+  "version": "1.0.0",
+  "description": "Beautiful web frontend for Synapse AI Chatbot",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "nodemon server.js",
+    "build": "echo 'No build step required for this frontend'",
+    "test": "echo 'No tests specified'"
+  },
+  "keywords": [
+    "chatbot",
+    "ai",
+    "frontend",
+    "web",
+    "synapse"
+  ],
+  "author": "Synapse AI Team",
+  "license": "MIT",
   "dependencies": {
     "@notionhq/client": "^5.1.0",
-    "express": "^4.18.2",
-    "body-parser": "^1.20.2"
+    "body-parser": "^1.20.3",
+    "cors": "^2.8.5",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
+  },
+  "engines": {
+    "node": ">=16.0.0"
   }
 }

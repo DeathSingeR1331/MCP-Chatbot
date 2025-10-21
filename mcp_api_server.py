@@ -11,6 +11,7 @@ import json
 import logging
 import re
 import signal
+import socket
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -91,6 +92,23 @@ try:
 except Exception:
     LOCAL_TZ = zoneinfo.ZoneInfo("Asia/Kolkata")
 
+# Port utilities
+def is_port_available(port: int) -> bool:
+    """Check if a port is available for binding."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(('0.0.0.0', port))
+            return True
+    except OSError:
+        return False
+
+def find_available_port(start_port: int = 8001, max_attempts: int = 10) -> int:
+    """Find an available port starting from start_port."""
+    for port in range(start_port, start_port + max_attempts):
+        if is_port_available(port):
+            return port
+    raise RuntimeError(f"No available ports found in range {start_port}-{start_port + max_attempts - 1}")
+
 # ------------------------------------------------------------------------------
 # Scheduling phrase parser
 # ------------------------------------------------------------------------------
@@ -161,7 +179,20 @@ async def lifespan(app: FastAPI):
     try:
         yield
     finally:
-        await shutdown_event()
+        try:
+            await shutdown_event()
+        except Exception as e:
+            logging.warning(f"Shutdown event error: {e}")
+        # Ensure we don't leave any hanging tasks
+        try:
+            # Cancel any remaining tasks
+            tasks = [task for task in asyncio.all_tasks() if not task.done()]
+            if tasks:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            logging.warning(f"Task cleanup error: {e}")
 
 
 app = FastAPI(title="MCP API Server", version="1.1.0", lifespan=lifespan)
@@ -284,7 +315,7 @@ async def shutdown_event():
         logging.info("🧹 Cleaning up MCP servers...")
         try:
             # Use asyncio.wait_for to prevent hanging
-            await asyncio.wait_for(mcp_session.cleanup_servers(), timeout=5.0)
+            await asyncio.wait_for(mcp_session.cleanup_servers(), timeout=3.0)
             logging.info("✅ MCP servers cleaned up")
         except asyncio.TimeoutError:
             logging.warning("⚠️ MCP server cleanup timed out, forcing shutdown")
@@ -293,8 +324,8 @@ async def shutdown_event():
         except Exception as e:
             logging.warning(f"Cleanup warning: {e}")
 
-    # Give a moment for cleanup to complete
-    await asyncio.sleep(0.1)
+    # Don't sleep during shutdown as it can cause cancellation errors
+    # The lifespan context will handle the final cleanup
 
 # ------------------------------------------------------------------------------
 # Routes
@@ -575,5 +606,11 @@ async def get_news_by_query(request: QueryRequest):
 # Entrypoint (optional)
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
-    print("Starting MCP API Server at http://localhost:8001")
-    uvicorn.run("mcp_api_server:app", host="0.0.0.0", port=8001, reload=False, log_level="info")
+    try:
+        # Find an available port
+        port = find_available_port(8001)
+        print(f"Starting MCP API Server at http://localhost:{port}")
+        uvicorn.run("mcp_api_server:app", host="0.0.0.0", port=port, reload=False, log_level="info")
+    except RuntimeError as e:
+        print(f"Error: {e}")
+        sys.exit(1)

@@ -9,10 +9,7 @@
         "command": "npx",
         "args": ["-y", "@openbnb/mcp-server-airbnb"]
       },
-      "sqlite": {
-        "command": "uvx",
-        "args": ["mcp-server-sqlite", "--db-path", "./test.db"]
-      },
+      
       "puppeteer": {
         "command": "npx",
         "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
@@ -24,7 +21,7 @@
             "@notionhq/notion-mcp-server"
         ],
         "env": {
-            "NOTION_TOKEN": "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"
+            "NOTION_TOKEN": "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"
         }
       },
       "gmail": {

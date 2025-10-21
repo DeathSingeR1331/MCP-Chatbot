@@ -1,0 +1,166 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Synapse AI Chatbot</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="header">
+            <div class="header-content">
+                <div class="logo">
+                    <i class="fas fa-brain"></i>
+                    <h1>Synapse AI</h1>
+                </div>
+                <div class="header-actions">
+                    <button class="btn btn-secondary" id="clearChatBtn">
+                        <i class="fas fa-trash"></i>
+                        Clear Chat
+                    </button>
+                    <button class="btn btn-primary" id="settingsBtn">
+                        <i class="fas fa-cog"></i>
+                        Settings
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Chat Area -->
+        <main class="chat-container">
+            <div class="chat-messages" id="chatMessages">
+                <!-- Welcome Message -->
+                <div class="message bot-message">
+                    <div class="message-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        <div class="message-text">
+                            <p>👋 Hello! I'm your Synapse AI assistant. I can help you with:</p>
+                            <ul>
+                                <li>📧 Gmail operations (send, read, search emails)</li>
+                                <li>🌐 Web browsing and automation</li>
+                                <li>📰 News and weather information</li>
+                                <li>💬 General conversations</li>
+                                <li>🔧 Various tools and integrations</li>
+                            </ul>
+                            <p>What would you like to do today?</p>
+                        </div>
+                        <div class="message-time">Just now</div>
+                    </div>
+                </div>
+            </div>
+
+            <!-- Typing Indicator -->
+            <div class="typing-indicator" id="typingIndicator">
+                <div class="message bot-message">
+                    <div class="message-avatar">
+                        <i class="fas fa-robot"></i>
+                    </div>
+                    <div class="message-content">
+                        <div class="typing-dots">
+                            <span></span>
+                            <span></span>
+                            <span></span>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </main>
+
+        <!-- Input Area -->
+        <footer class="input-container">
+            <div class="input-wrapper">
+                <div class="input-actions">
+                    <button class="btn btn-icon" id="attachBtn" title="Attach file">
+                        <i class="fas fa-paperclip"></i>
+                    </button>
+                    <button class="btn btn-icon" id="voiceBtn" title="Voice input">
+                        <i class="fas fa-microphone"></i>
+                    </button>
+                </div>
+                <div class="input-field-container">
+                    <textarea 
+                        id="messageInput" 
+                        placeholder="Type your message here..."
+                        rows="1"
+                        maxlength="2000"
+                    ></textarea>
+                    <div class="input-counter" id="charCounter">0/2000</div>
+                </div>
+                <button class="btn btn-primary btn-send" id="sendBtn" disabled>
+                    <i class="fas fa-paper-plane"></i>
+                </button>
+            </div>
+            <div class="quick-actions">
+                <button class="quick-action-btn" data-action="gmail">
+                    <i class="fas fa-envelope"></i>
+                    Gmail
+                </button>
+                <button class="quick-action-btn" data-action="weather">
+                    <i class="fas fa-cloud-sun"></i>
+                    Weather
+                </button>
+                <button class="quick-action-btn" data-action="news">
+                    <i class="fas fa-newspaper"></i>
+                    News
+                </button>
+                <button class="quick-action-btn" data-action="browse">
+                    <i class="fas fa-globe"></i>
+                    Browse
+                </button>
+            </div>
+        </footer>
+
+        <!-- Settings Modal -->
+        <div class="modal" id="settingsModal">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h2>Settings</h2>
+                    <button class="btn btn-icon" id="closeSettingsBtn">
+                        <i class="fas fa-times"></i>
+                    </button>
+                </div>
+                <div class="modal-body">
+                    <div class="setting-group">
+                        <label for="userName">Your Name</label>
+                        <input type="text" id="userName" placeholder="Enter your name">
+                        <small>I'll remember this name across all our conversations</small>
+                    </div>
+                    <div class="setting-group">
+                        <label for="theme">Theme</label>
+                        <select id="theme">
+                            <option value="light">Light</option>
+                            <option value="dark">Dark</option>
+                            <option value="auto">Auto</option>
+                        </select>
+                    </div>
+                    <div class="setting-group">
+                        <label for="llmProvider">AI Provider</label>
+                        <select id="llmProvider">
+                            <option value="groq">Groq (Fast)</option>
+                            <option value="openai">OpenAI</option>
+                            <option value="gemini">Google Gemini</option>
+                            <option value="claude">Anthropic Claude</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn btn-secondary" id="cancelSettingsBtn">Cancel</button>
+                    <button class="btn btn-primary" id="saveSettingsBtn">Save Settings</button>
+                </div>
+            </div>
+        </div>
+
+        <!-- Toast Notifications -->
+        <div class="toast-container" id="toastContainer"></div>
+    </div>
+
+    <script src="script.js"></script>
+</body>
+</html>
+

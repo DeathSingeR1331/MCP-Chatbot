@@ -387,8 +387,13 @@ def get_scheduler():
 def shutdown_scheduler():
     global _scheduler
     if _scheduler:
-        _scheduler.shutdown(wait=False)
-        _scheduler = None
+        try:
+            _scheduler.shutdown(wait=False)
+            logging.info("Scheduler has been shut down")
+        except Exception as e:
+            logging.warning(f"Scheduler shutdown warning: {e}")
+        finally:
+            _scheduler = None
 
 async def _execute_job(user_id: str, action: str, job_id: str):
     """Actual async job that calls your MCP executor."""

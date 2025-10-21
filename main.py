@@ -255,7 +255,7 @@ class Server:
             try:
                 if self.session:
                     try:
-                        await asyncio.wait_for(self.session.__aexit__(None, None, None), timeout=3.0)
+                        await asyncio.wait_for(self.session.__aexit__(None, None, None), timeout=2.0)
                     except asyncio.TimeoutError:
                         logging.warning(f"Session cleanup timeout for {self.name}, forcing cleanup")
                     except asyncio.CancelledError:
@@ -266,7 +266,7 @@ class Server:
                         self.session = None
                 if self.stdio_context:
                     try:
-                        await asyncio.wait_for(self.stdio_context.__aexit__(None, None, None), timeout=2.0)
+                        await asyncio.wait_for(self.stdio_context.__aexit__(None, None, None), timeout=1.0)
                     except asyncio.TimeoutError:
                         logging.warning(f"Stdio cleanup timeout for {self.name}, forcing cleanup")
                     except (RuntimeError, asyncio.CancelledError) as e:
@@ -500,6 +500,11 @@ class ChatSession:
         self.llm_client: MultiLLMClient = llm_client
         self.tools_loaded: bool = False
         self.all_tools: List[Tool] = []
+        self.user_name: Optional[str] = None
+        # Use absolute path to ensure consistent file location
+        self.user_data_file: str = os.path.abspath("user_data.json")
+        logging.info(f"User data file path: {self.user_data_file}")
+        self._load_user_data()
 
     async def cleanup_servers(self) -> None:
         cleanup_tasks = []
@@ -507,7 +512,11 @@ class ChatSession:
             cleanup_tasks.append(asyncio.create_task(server.cleanup()))
         if cleanup_tasks:
             try:
-                results = await asyncio.gather(*cleanup_tasks, return_exceptions=True)
+                # Use a shorter timeout and handle cancellation gracefully
+                results = await asyncio.wait_for(
+                    asyncio.gather(*cleanup_tasks, return_exceptions=True),
+                    timeout=2.0
+                )
                 for i, result in enumerate(results):
                     if isinstance(result, Exception):
                         server_name = self.servers[i].name if i < len(self.servers) else f"server_{i}"
@@ -515,21 +524,162 @@ class ChatSession:
                             logging.info(f"Note: Normal shutdown message for {server_name}: {result}")
                         else:
                             logging.warning(f"Warning during session cleanup for {server_name}: {result}")
+            except asyncio.TimeoutError:
+                logging.warning("Server cleanup timed out, forcing shutdown")
+            except asyncio.CancelledError:
+                logging.info("Server cleanup was cancelled (normal during shutdown)")
             except Exception as e:
                 logging.warning(f"Warning during final cleanup: {e}")
+
+    def _load_user_data(self) -> None:
+        """Load user data from persistent storage."""
+        try:
+            logging.info(f"Attempting to load user data from: {self.user_data_file}")
+            if os.path.exists(self.user_data_file):
+                with open(self.user_data_file, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                    self.user_name = data.get('user_name')
+                    if self.user_name:
+                        logging.info(f"✅ Successfully loaded user name: {self.user_name}")
+                    else:
+                        logging.info("No user name found in data file")
+            else:
+                logging.info("User data file does not exist yet")
+        except Exception as e:
+            logging.error(f"❌ Failed to load user data: {e}")
+            self.user_name = None
+
+    def _save_user_data(self) -> None:
+        """Save user data to persistent storage."""
+        try:
+            data = {
+                'user_name': self.user_name
+            }
+            logging.info(f"Attempting to save user data to: {self.user_data_file}")
+            with open(self.user_data_file, 'w', encoding='utf-8') as f:
+                json.dump(data, f, indent=2, ensure_ascii=False)
+            logging.info(f"✅ Successfully saved user data: {data}")
+            
+            # Verify the file was created and can be read
+            if os.path.exists(self.user_data_file):
+                with open(self.user_data_file, 'r', encoding='utf-8') as f:
+                    verify_data = json.load(f)
+                    logging.info(f"✅ Verified saved data: {verify_data}")
+            else:
+                logging.error("❌ File was not created successfully")
+        except Exception as e:
+            logging.error(f"❌ Failed to save user data: {e}")
+            logging.error(f"File path: {self.user_data_file}")
+            logging.error(f"Current working directory: {os.getcwd()}")
+
+    def _extract_name_from_message(self, message: str) -> Optional[str]:
+        """Extract name from user message when they set their name."""
+        import re
+        
+        # More comprehensive patterns for name extraction
+        patterns = [
+            # "my name is abc", "call me abc", "i am abc", "set my name to abc"
+            r"(?:my name is|call me|i am|set my name to|remember my name as|change my name to|update my name to)\s+([a-zA-Z0-9\s\-\.']+)",
+            # "name is abc", "call me abc"
+            r"(?:name is|call me)\s+([a-zA-Z0-9\s\-\.']+)",
+            # "abc" (simple case - just the name)
+            r"^([a-zA-Z0-9\s\-\.']+)$",
+            # "from now on call me abc"
+            r"(?:from now on|please)\s+(?:call me|name me)\s+([a-zA-Z0-9\s\-\.']+)",
+            # "i want to be called abc"
+            r"(?:i want to be called|i want you to call me)\s+([a-zA-Z0-9\s\-\.']+)"
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, message.lower())
+            if match:
+                name = match.group(1).strip()
+                # Clean up the name but preserve it properly
+                if name and len(name) > 1:
+                    # Remove common words that might be at the beginning or end
+                    words = name.split()
+                    filtered_words = []
+                    
+                    for word in words:
+                        # Skip common words but keep the actual name
+                        if word.lower() not in ['is', 'am', 'to', 'as', 'the', 'a', 'an', 'from', 'now', 'on', 'please', 'me', 'my', 'name']:
+                            filtered_words.append(word)
+                    
+                    if filtered_words:
+                        filtered_name = ' '.join(filtered_words).strip()
+                        if filtered_name and len(filtered_name) > 1:
+                            return filtered_name
+        return None
+
+    def _detect_name_setting(self, message: str) -> bool:
+        """Detect if user is trying to set their name."""
+        lowered = message.lower()
+        
+        # First check for query patterns (asking about name, not setting it)
+        query_patterns = [
+            "what's my name", "what is my name", "whats my name",
+            "do you remember my name", "do you know my name",
+            "tell me my name", "what name do you have"
+        ]
+        
+        # If it's a query, it's not a name setting request
+        if any(pattern in lowered for pattern in query_patterns):
+            return False
+        
+        # Then check for setting patterns
+        name_indicators = [
+            "my name is", "call me", "i am", "set my name", "remember my name",
+            "change my name", "update my name", "name is",
+            "from now on call me", "please call me", "i want to be called",
+            "i want you to call me", "name me", "call me from now on"
+        ]
+        return any(indicator in lowered for indicator in name_indicators)
+
+    def _handle_name_conflict(self, new_name: str) -> str:
+        """Handle conflicts between user-set names and profile information."""
+        if self.user_name and self.user_name != new_name:
+            logging.info(f"Name conflict detected: current='{self.user_name}', new='{new_name}'")
+            return f"✅ Got it! I've updated your name from '{self.user_name}' to '{new_name}'. I'll remember you as {new_name} from now on! 😊"
+        else:
+            return f"✅ Got it! I'll remember your name as {new_name}. Nice to meet you, {new_name}! 😊"
+
+    def _detect_name_query(self, message: str) -> bool:
+        """Detect if user is asking about their name."""
+        lowered = message.lower()
+        query_patterns = [
+            "what's my name", "what is my name", "whats my name",
+            "do you remember my name", "do you know my name",
+            "tell me my name", "what name do you have",
+            "what do you call me", "how do you know me"
+        ]
+        return any(pattern in lowered for pattern in query_patterns)
+
+    def _handle_name_query(self) -> str:
+        """Handle when user asks about their name."""
+        if self.user_name:
+            return f"Your name is {self.user_name}! I remember that from our previous conversations. 😊"
+        else:
+            return "I don't have a name set for you yet. You can tell me your name by saying something like 'My name is John' or 'Call me Sarah'."
 
     async def chat(self, user_message: str) -> str:
         try:
             lowered = user_message.lower()
-            # Detect explicit Spotify playback requests.  If the user mentions
-            # Spotify and "play", or requests to play a song on Spotify, we
-            # bypass the LLM and call our helper directly.  This has
-            # precedence over the generic YouTube handler below.
-            if ("spotify" in lowered and "play" in lowered) or " on spotify" in lowered:
-                song_query = self._extract_spotify_song_query(lowered)
-                if song_query:
-                    played = await self._play_spotify_song(song_query)
-                    return "Playing on Spotify." if played else "Failed to start playback on Spotify."
+
+            # Check if user is asking about their name
+            if self._detect_name_query(user_message):
+                return self._handle_name_query()
+            
+            # Check if user is setting their name
+            if self._detect_name_setting(user_message):
+                extracted_name = self._extract_name_from_message(user_message)
+                if extracted_name:
+                    # Always prioritize user-set names over profile information
+                    old_name = self.user_name
+                    self.user_name = extracted_name
+                    self._save_user_data()
+                    return self._handle_name_conflict(extracted_name)
+                else:
+                    return "❌ I couldn't understand what name you'd like me to remember. Please try saying something like 'My name is John' or 'Call me Sarah'."
 
             # Detect Gmail requests: send email, read emails, search emails, open gmail
             if (("gmail" in lowered and "send" in lowered) or 
@@ -559,6 +709,7 @@ class ChatSession:
             if gmail_advanced_result:
                 return gmail_advanced_result
 
+
             # Detect YouTube playback requests: either mention YouTube and play, or start with "play "
             if ("youtube" in lowered and "play" in lowered) or lowered.startswith("play "):
                 song_query = self._extract_youtube_song_query(lowered)
@@ -566,13 +717,19 @@ class ChatSession:
                     played = await self._play_youtube_song(song_query)
                     return "Playing on YouTube." if played else "Failed to start playback on YouTube."
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
+            
+            # Add user name to system message if available
+            user_name_context = ""
+            if self.user_name:
+                user_name_context = f"\n\nIMPORTANT: The user's name is {self.user_name}. Always address them by their name when appropriate and use it in your responses to make them more personal and friendly."
+            
             # Construct a system message that guides the language model on how to select and
             # invoke tools.  The instructions below emphasise when to use specific tools and
             # when to avoid using browser automation for information retrieval.  In particular,
             # news and general knowledge queries are explicitly covered to prevent the model
             # from falling back to generic browser evaluations (e.g. reading a page title)
             # when a simpler or more appropriate method exists.
-            system_message = f"""You are a helpful assistant with access to these tools: \n\n{tools_description}\n\nIMPORTANT RULES:\n1. For NEWS queries (like "latest news", "headlines", "sports news", etc.), ALWAYS use the `get_news` tool with appropriate query parameters.\n2. For WEATHER queries, use the `get_weather` tool with the city name.\n3. For GMAIL queries (like "send email", "read emails", "search emails", "mark emails as read"), DO NOT use browser automation. The system will handle Gmail operations automatically through MCP Gmail tools.\n4. For general knowledge questions, answer directly using your knowledge.\n5. For web browsing tasks, use browser tools like `browser_navigate`, `browser_click`, etc.\n\nWhen you need to use a tool, respond with ONLY this JSON format (nothing else):\n{{\n    \"tool\": \"tool_name\",\n    \"arguments\": {{\n        \"param\": \"value\"\n    }}\n}}\n\nAfter tool execution, provide a natural, conversational response based on the results."""
+            system_message = f"""You are a helpful assistant with access to these tools: \n\n{tools_description}\n\nIMPORTANT RULES:\n1. For NEWS queries (like "latest news", "headlines", "sports news", etc.), ALWAYS use the `get_news` tool with appropriate query parameters.\n2. For WEATHER queries, use the `get_weather` tool with the city name.\n3. For GMAIL queries (like "send email", "read emails", "search emails", "mark emails as read"), DO NOT use browser automation. The system will handle Gmail operations automatically through MCP Gmail tools.\n4. For general knowledge questions, answer directly using your knowledge.\n5. For web browsing tasks, use browser tools like `browser_navigate`, `browser_click`, etc.\n\nWhen you need to use a tool, respond with ONLY this JSON format (nothing else):\n{{\n    \"tool\": \"tool_name\",\n    \"arguments\": {{\n        \"param\": \"value\"\n    }}\n}}\n\nAfter tool execution, provide a natural, conversational response based on the results.{user_name_context}"""
             messages = [
                 {"role": "system", "content": system_message},
                 {"role": "user", "content": user_message},
@@ -882,14 +1039,11 @@ class ChatSession:
         """
         # Lazy import to avoid requiring Playwright if Spotify is never used
         try:
-            from .spotify_play import play_spotify_song  # type: ignore
-        except Exception:
-            try:
-                # Fallback for environments where package-relative import isn't available
-                from spotify_play import play_spotify_song  # type: ignore
-            except Exception:
-                logging.error("Spotify playback helper could not be imported")
-                return False
+            import spotify_play_final_solution
+            play_spotify_song = spotify_play_final_solution.play_spotify_song_final_solution
+        except Exception as e:
+            logging.error(f"Spotify playback helper could not be imported: {e}")
+            return False
         # Gather credentials from configuration or environment
         email = os.getenv("SPOTIFY_EMAIL") or None
         password = os.getenv("SPOTIFY_PASSWORD") or None
@@ -1048,6 +1202,8 @@ class ChatSession:
             return match2.group(1)
         
         return None
+
+
 
     async def _handle_gmail_send_via_mcp(self, email_data: Dict) -> str:
         """Handle Gmail send via MCP AutoAuth server."""
@@ -1220,6 +1376,7 @@ class ChatSession:
             if server.name == "gmail":
                 return server
         return None
+
 
     def _extract_attachment_paths(self, text: str) -> List[str]:
         """Extract file paths from user message."""
@@ -1504,6 +1661,8 @@ class ChatSession:
         # This is a simplified version - in practice, you'd want more sophisticated parsing
         return "❌ Filter creation requires specific parameters. Please use the Gmail interface for complex filters."
 
+
+
     async def _handle_gmail_send_via_browser(self, lowered: str) -> str:
         """Handle Gmail send via browser automation as fallback."""
         try:
@@ -1525,7 +1684,7 @@ class ChatSession:
                         break
                 except Exception:
                     continue
-            
+                    
             if not browser_server:
                 return "❌ No browser automation server available for Gmail sending."
             
@@ -1547,10 +1706,9 @@ class ChatSession:
             await browser_server.execute_tool("browser_evaluate", {"function": compose_js})
             await asyncio.sleep(2)
             
-            # Fill recipient field - Updated selectors based on actual Gmail structure
+            # Fill recipient field
             recipient_js = f"""
             () => {{
-                // Try multiple selectors for the recipient field
                 const selectors = [
                     'input[aria-label*="To"]',
                     'input[placeholder*="To"]', 
@@ -1565,7 +1723,7 @@ class ChatSession:
                 let toField = null;
                 for (const selector of selectors) {{
                     toField = document.querySelector(selector);
-                    if (toField && toField.offsetParent !== null) {{ // Check if visible
+                    if (toField && toField.offsetParent !== null) {{
                         break;
                     }}
                 }}
@@ -1574,15 +1732,10 @@ class ChatSession:
                     toField.focus();
                     toField.click();
                     toField.value = "{email_data['to']}";
-                    
-                    // Trigger events to make Gmail recognize the input
                     toField.dispatchEvent(new Event('input', {{ bubbles: true }}));
                     toField.dispatchEvent(new Event('change', {{ bubbles: true }}));
                     toField.dispatchEvent(new Event('blur', {{ bubbles: true }}));
-                    
-                    // Try pressing Enter to confirm the recipient
                     toField.dispatchEvent(new KeyboardEvent('keydown', {{ key: 'Enter', bubbles: true }}));
-                    
                     return true;
                 }}
                 return false;
@@ -1624,31 +1777,25 @@ class ChatSession:
             await browser_server.execute_tool("browser_evaluate", {"function": body_js})
             await asyncio.sleep(2)
             
-            # Click Send button - Updated selectors based on actual Gmail structure
+            # Click Send button
             send_js = """
             () => {
-                // Try multiple selectors for the send button
                 const selectors = [
                     'button[aria-label*="Send"]',
                     'button[aria-label*="send"]',
                     'div[role="button"][aria-label*="Send"]',
                     'div[role="button"][aria-label*="send"]',
-                    '.T-I.J-J5-Ji.aoO.T-I-atl.L3',
-                    'button:contains("Send")',
-                    'div[role="button"]:contains("Send")',
-                    'button[data-tooltip*="Send"]',
-                    'div[data-tooltip*="Send"]'
+                    '.T-I.J-J5-Ji.aoO.T-I-atl.L3'
                 ];
                 
                 let sendButton = null;
                 for (const selector of selectors) {
                     sendButton = document.querySelector(selector);
-                    if (sendButton && sendButton.offsetParent !== null) { // Check if visible
+                    if (sendButton && sendButton.offsetParent !== null) {
                         break;
                     }
                 }
                 
-                // If no button found with selectors, try to find by text content
                 if (!sendButton) {
                     const buttons = document.querySelectorAll('button, div[role="button"]');
                     for (const button of buttons) {
@@ -1671,10 +1818,11 @@ class ChatSession:
             await asyncio.sleep(3)
             
             return f"📧 Email sent successfully via browser automation to {email_data['to']}!"
-            
+                    
         except Exception as e:
             logging.error(f"Gmail browser automation failed: {e}")
             return f"❌ Gmail send failed via browser automation: {str(e)}"
+
 
     async def _search_gmail_via_browser_old(self, query: str) -> List[Dict]:
         """Search emails via Gmail.com browser automation - SAME PATTERN AS YOUTUBE.
@@ -1962,6 +2110,12 @@ class ChatSession:
             print("\nType /help for commands or start chatting!")
             print("="*70)
             tools_description = "\n".join([tool.format_for_llm() for tool in self.all_tools]) if self.all_tools else "No tools available."
+            
+            # Add user name to system message if available
+            user_name_context = ""
+            if self.user_name:
+                user_name_context = f"\n\nIMPORTANT: The user's name is {self.user_name}. Always address them by their name when appropriate and use it in your responses to make them more personal and friendly."
+            
             # Construct a concise system message for the interactive CLI.  This message
             # instructs the model how to choose tools and includes specific guidance for
             # handling news and general knowledge queries without resorting to browser
@@ -1988,7 +2142,7 @@ class ChatSession:
                 "3. Focus on the most relevant information\n"
                 "4. Use appropriate context from the user's question\n"
                 "5. Avoid simply repeating the raw data\n\n"
-                "Please use only the tools that are explicitly defined above."
+                "Please use only the tools that are explicitly defined above.{user_name_context}"
             )
             messages = [
                 {"role": "system", "content": system_message},
@@ -2003,6 +2157,25 @@ class ChatSession:
                         if should_exit:
                             break
                         continue
+                    
+                    # Check if user is asking about their name
+                    if self._detect_name_query(user_input):
+                        print(self._handle_name_query())
+                        continue
+                    
+                    # Check if user is setting their name
+                    if self._detect_name_setting(user_input):
+                        extracted_name = self._extract_name_from_message(user_input)
+                        if extracted_name:
+                            # Always prioritize user-set names over profile information
+                            self.user_name = extracted_name
+                            self._save_user_data()
+                            print(self._handle_name_conflict(extracted_name))
+                            continue
+                        else:
+                            print("❌ I couldn't understand what name you'd like me to remember. Please try saying something like 'My name is John' or 'Call me Sarah'.")
+                            continue
+                    
                     messages.append({"role": "user", "content": user_input})
                     llm_response = self.llm_client.get_response(messages)
                     assistant_output = llm_response
@@ -2101,6 +2274,22 @@ class ChatSession:
                 print(f"🎯 Current provider: {current.value}\n")
             else:
                 print("🎯 Using automatic fallback (no specific provider set)\n")
+        elif cmd in ['/name', '/n']:
+            if self.user_name:
+                print(f"👤 Your name: {self.user_name}")
+                print(f"📁 Stored in: {self.user_data_file}")
+                print(f"📄 File exists: {os.path.exists(self.user_data_file)}\n")
+            else:
+                print("👤 No name set yet. You can set your name by saying something like 'My name is John' or 'Call me Sarah'.")
+                print(f"📁 Will be stored in: {self.user_data_file}\n")
+        elif cmd in ['/clear-name', '/cn']:
+            old_name = self.user_name
+            self.user_name = None
+            self._save_user_data()
+            if old_name:
+                print(f"✅ Cleared your name '{old_name}'. You can set a new name anytime.\n")
+            else:
+                print("✅ No name was set to clear.\n")
         elif cmd in ['/weather'] and len(parts) >= 3:
             try:
                 lat, lon = float(parts[1]), float(parts[2])
@@ -2150,6 +2339,8 @@ class ChatSession:
         print("  /providers, /p         - List available LLM providers")
         print("  /switch <provider>     - Switch to different LLM provider")
         print("  /current, /c           - Show current LLM provider")
+        print("  /name, /n              - Show your remembered name")
+        print("  /clear-name, /cn       - Clear your remembered name")
         print("  /fallback, /f          - Toggle automatic fallback mode")
         print("  /weather <lat> <lon>   - Get weather data for coordinates")
         print("  /tools, /t             - List available MCP tools")
@@ -2164,6 +2355,8 @@ class ChatSession:
         print("  /switch groq           - Switch to Groq API")
         print("  /switch ollama_mistral - Switch to local Mistral")
         print("  /weather 37.7749 -122.4194 - Weather for San Francisco")
+        print("  My name is John        - Set your name to John")
+        print("  Call me Sarah          - Set your name to Sarah")
         fallback_status = "enabled" if self.llm_client.fallback_mode else "disabled"
         print(f"\n🔄 Fallback Mode: {fallback_status}")
         print("   (When enabled, tries other providers if selected one fails)")
