@@ -1,0 +1,16 @@
+# Simple test Dockerfile
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install basic dependencies
+RUN pip install fastapi uvicorn
+
+# Copy test server
+COPY test_server.py .
+
+# Expose port
+EXPOSE 8001
+
+# Start test server
+CMD ["python", "test_server.py"]

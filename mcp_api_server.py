@@ -9,6 +9,7 @@ MCP API Server for Synapse Frontend Integration
 import asyncio
 import json
 import logging
+import os
 import re
 import signal
 import socket
@@ -221,6 +222,12 @@ async def startup_event():
     try:
         logging.info("🚀 Starting MCP API Server...")
 
+        # Check if imports are available
+        if Configuration == object or MultiLLMClient == object:
+            logging.warning("⚠️ MCP modules not available, running in basic mode")
+            initialized = True
+            return
+
         # Load config & LLM
         config = Configuration()
         llm_client = MultiLLMClient(config)
@@ -400,7 +407,11 @@ async def list_tools():
 async def process_query(request: QueryRequest):
     """Schedule or execute a query."""
     if not initialized or not mcp_session:
-        raise HTTPException(status_code=503, detail="MCP servers not initialized")
+        # Fallback response when MCP is not available
+        return QueryResponse(
+            response=f"🤖 MCP Chatbot is running in basic mode. Your query: '{request.query}'\n\nNote: Full MCP functionality is not available. The server is running but MCP modules failed to initialize.",
+            success=True
+        )
 
     try:
         plan = _parse_schedule(request.query)
@@ -612,9 +623,9 @@ async def get_news_by_query(request: QueryRequest):
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        # Find an available port
-        port = find_available_port(8001)
-        print(f"Starting MCP API Server at http://localhost:{port}")
+        # Use Railway's PORT environment variable or default to 8001
+        port = int(os.getenv("PORT", 8001))
+        print(f"Starting MCP API Server at http://0.0.0.0:{port}")
         uvicorn.run("mcp_api_server:app", host="0.0.0.0", port=port, reload=False, log_level="info")
     except RuntimeError as e:
         print(f"Error: {e}")
