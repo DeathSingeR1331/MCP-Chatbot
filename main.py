@@ -34,25 +34,34 @@ except ImportError:
 
 # Ollama removed - only using Groq and Gemini
 
-try:
-    from test_notion import (
-        test_comment_on_page,
-        test_search_pages,
-        test_list_databases,
-        test_retrieve_comments,
-        test_query_database,
-        test_retrieve_page,
-        test_get_page_blocks,
-    )  # reuse working functions
-except ImportError:
-    # test_notion module not available, define stub functions
-    def test_comment_on_page(*args, **kwargs): pass
-    def test_search_pages(*args, **kwargs): pass
-    def test_list_databases(*args, **kwargs): pass
-    def test_retrieve_comments(*args, **kwargs): pass
-    def test_query_database(*args, **kwargs): pass
-    def test_retrieve_page(*args, **kwargs): pass
-    def test_get_page_blocks(*args, **kwargs): pass
+# Notion integration functions (stub implementations)
+def test_comment_on_page(*args, **kwargs): 
+    """Stub function for Notion page commenting"""
+    pass
+
+def test_search_pages(*args, **kwargs): 
+    """Stub function for Notion page search"""
+    pass
+
+def test_list_databases(*args, **kwargs): 
+    """Stub function for Notion database listing"""
+    pass
+
+def test_retrieve_comments(*args, **kwargs): 
+    """Stub function for Notion comment retrieval"""
+    pass
+
+def test_query_database(*args, **kwargs): 
+    """Stub function for Notion database querying"""
+    pass
+
+def test_retrieve_page(*args, **kwargs): 
+    """Stub function for Notion page retrieval"""
+    pass
+
+def test_get_page_blocks(*args, **kwargs): 
+    """Stub function for Notion page blocks"""
+    pass
 
 # Configure logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
