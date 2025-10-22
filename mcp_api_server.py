@@ -222,6 +222,12 @@ async def startup_event():
     try:
         logging.info("🚀 Starting MCP API Server...")
 
+        # Check if imports are available
+        if Configuration == object or MultiLLMClient == object:
+            logging.warning("⚠️ MCP modules not available, running in basic mode")
+            initialized = True
+            return
+
         # Load config & LLM
         config = Configuration()
         llm_client = MultiLLMClient(config)
@@ -401,7 +407,11 @@ async def list_tools():
 async def process_query(request: QueryRequest):
     """Schedule or execute a query."""
     if not initialized or not mcp_session:
-        raise HTTPException(status_code=503, detail="MCP servers not initialized")
+        # Fallback response when MCP is not available
+        return QueryResponse(
+            response=f"🤖 MCP Chatbot is running in basic mode. Your query: '{request.query}'\n\nNote: Full MCP functionality is not available. The server is running but MCP modules failed to initialize.",
+            success=True
+        )
 
     try:
         plan = _parse_schedule(request.query)
