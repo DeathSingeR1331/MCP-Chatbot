@@ -1,0 +1,13 @@
+[
+  {
+    "id": "task_0_1760134399",
+    "user_id": "3a5a14b0-0244-4a3a-865b-df6698ff1a87",
+    "original_query": "set alarm in clock app at 6:30 am called Kesariya",
+    "action": "set alarm in clock app at 6:30 am called Kesariya",
+    "execute_at": "2025-10-11T06:30:00",
+    "is_recurring": false,
+    "recurring_pattern": null,
+    "status": "pending",
+    "created_at": "2025-10-11T03:43:19.538465"
+  }
+]

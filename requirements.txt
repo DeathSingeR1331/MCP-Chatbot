@@ -1,0 +1,21 @@
+python-dotenv>=1.0.0
+requests>=2.31.0
+mcp>=1.0.0
+uvicorn>=0.32.1
+fastapi>=0.104.0
+google-generativeai>=0.8.0
+groq>=0.4.0
+playwright>=1.46.0
+apscheduler>=3.10.0
+tzlocal>=4.0
+
+
+# Gmail integration
+google-auth>=2.23.0
+google-auth-oauthlib>=1.1.0
+google-api-python-client>=2.99.0
+
+# WhatsApp integration
+whatsapp-api-client-python>=1.0.0
+
+

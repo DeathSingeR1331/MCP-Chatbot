@@ -1,0 +1,34 @@
+{
+    "mcpServers": {
+      "playwright": {
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "env": { "DISPLAY": ":1" }
+      },
+      "airbnb": {
+        "command": "npx",
+        "args": ["-y", "@openbnb/mcp-server-airbnb"]
+      },
+      
+      "puppeteer": {
+        "command": "npx",
+        "args": ["-y", "@modelcontextprotocol/server-puppeteer"]
+      },
+      "notionApi": {
+        "command": "npx",
+        "args": [
+            "-y",
+            "@notionhq/notion-mcp-server"
+        ],
+        "env": {
+            "NOTION_TOKEN": "YOUR_NOTION_TOKEN_HERE"
+        }
+      },
+      "gmail": {
+        "command": "npx",
+        "args": [
+            "@gongrzhe/server-gmail-autoauth-mcp"
+        ]
+      }
+    }
+}
