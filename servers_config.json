@@ -21,7 +21,7 @@
             "@notionhq/notion-mcp-server"
         ],
         "env": {
-            "NOTION_TOKEN": "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"
+            "NOTION_TOKEN": "YOUR_NOTION_TOKEN_HERE"
         }
       },
       "gmail": {
