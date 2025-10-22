@@ -9,6 +9,7 @@ MCP API Server for Synapse Frontend Integration
 import asyncio
 import json
 import logging
+import os
 import re
 import signal
 import socket
@@ -612,9 +613,9 @@ async def get_news_by_query(request: QueryRequest):
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
-        # Find an available port
-        port = find_available_port(8001)
-        print(f"Starting MCP API Server at http://localhost:{port}")
+        # Use Railway's PORT environment variable or default to 8001
+        port = int(os.getenv("PORT", 8001))
+        print(f"Starting MCP API Server at http://0.0.0.0:{port}")
         uvicorn.run("mcp_api_server:app", host="0.0.0.0", port=port, reload=False, log_level="info")
     except RuntimeError as e:
         print(f"Error: {e}")
